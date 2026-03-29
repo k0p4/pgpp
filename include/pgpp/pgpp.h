@@ -19,7 +19,7 @@
 
 #pragma once
 
-#include "pgpp_connection.h"
+#include <pgpp/pgpp_connection.h>
 
 #include <atomic>
 #include <condition_variable>

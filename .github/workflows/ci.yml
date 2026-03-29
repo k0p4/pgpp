@@ -1,0 +1,140 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  Build-Linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        build_type: [Debug, Release]
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: "Install dependencies"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpq-dev
+
+      - name: "Set compiler"
+        if: matrix.compiler == 'clang'
+        run: |
+          echo "CC=clang" >> $GITHUB_ENV
+          echo "CXX=clang++" >> $GITHUB_ENV
+
+      - uses: actions/checkout@v6
+
+      - name: Build
+        run: |
+          cmake -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -G "Unix Makefiles" -B build
+          cmake --build build --config ${{matrix.build_type}} -j $(nproc)
+
+
+  Build-Windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build
+        shell: bash
+        run: |
+          cmake -DPostgreSQL_ROOT="$PGROOT" -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -G "Visual Studio 17 2022" -B build
+          cmake --build build --config ${{matrix.build_type}} -j $NUMBER_OF_PROCESSORS
+
+
+  Build-MacOS:
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: "Install dependencies"
+        run: brew install libpq
+
+      - uses: actions/checkout@v6
+
+      - name: Build
+        run: |
+          cmake -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -DCMAKE_PREFIX_PATH="$(brew --prefix libpq)" -G "Unix Makefiles" -B build
+          cmake --build build --config ${{matrix.build_type}} -j $(sysctl -n hw.ncpu)
+
+
+  CodeChecker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: "Install LLVM and dependencies"
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-20 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update
+          sudo apt-get install -y clang-20 clang-tidy-20 libpq-dev
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-20 100
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-20 100
+          sudo update-alternatives --install /usr/bin/clang-tidy clang-tidy /usr/bin/clang-tidy-20 100
+
+      - name: "Install CodeChecker"
+        run: |
+          python3 -m venv /tmp/codechecker-venv
+          /tmp/codechecker-venv/bin/pip install codechecker
+          echo "/tmp/codechecker-venv/bin" >> $GITHUB_PATH
+
+      - uses: actions/checkout@v6
+
+      - name: "Build for analysis"
+        run: |
+          cmake \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -G "Unix Makefiles" \
+            -B build
+          cmake --build build --config Debug -j $(nproc)
+
+      - name: "Run analysis"
+        run: |
+          echo "-/usr/include/*" > skipfile.txt
+          echo "-$(pwd)/build*" >> skipfile.txt
+
+          mkdir codechecker-reports
+          CodeChecker analyze \
+            -i skipfile.txt \
+            -j $(nproc) \
+            -o report \
+            build/compile_commands.json \
+            --analyzers clang-tidy clangsa \
+            --config .codechecker.json
+          CodeChecker parse ./report --trim-path-prefix "$(pwd)" | tee ./codechecker-reports/results.txt || true
+          CodeChecker parse ./report --trim-path-prefix "$(pwd)" -e html -o ./codechecker-reports/html > /dev/null || true
+          CodeChecker parse ./report --trim-path-prefix "$(pwd)" > /dev/null && touch ./ccOK || true
+
+      - name: "Upload results"
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: CodeChecker report
+          path: codechecker-reports
+
+      - name: "Check results"
+        run: |
+          [ -f "./ccOK" ] || exit 1

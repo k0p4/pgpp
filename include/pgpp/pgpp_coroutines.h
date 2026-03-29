@@ -19,7 +19,7 @@
 
 #pragma once
 
-#include "pgpp.h"
+#include <pgpp/pgpp.h>
 
 #include <coroutine>
 #include <exception>

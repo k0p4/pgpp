@@ -17,7 +17,7 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 
-#include "pgpp.h"
+#include <pgpp/pgpp.h>
 #include "pgpp_log.h"
 PGPP_DEFINE_LOG_MODULE(PgppPool)
 
