@@ -30,78 +30,94 @@ target_link_libraries(myapp PRIVATE pgpp)
 
 Requires PostgreSQL development headers (`libpq-dev` / `postgresql-devel`).
 
-### Basic Usage
+### Minimal Example
 
 ```cpp
 #include <pgpp.h>
+#include <iostream>
 
-PgppConnectionInfo info;
-info.host     = "127.0.0.1";
-info.port     = 5432;
-info.dbname   = "mydb";
-info.user     = "postgres";
-info.password = "secret";
+int main()
+{
+    PgppConnectionInfo info;
+    info.host     = "127.0.0.1";
+    info.port     = 5432;
+    info.dbname   = "mydb";
+    info.user     = "postgres";
+    info.password = "secret";
 
-PgppPool pool;
-pool.initialize(info, 4);  // 4 connections
+    PgppPool db;
+    db.initialize(info, 4);  // 4 worker threads, 4 connections
 
-// Prepare a statement
-Statement stmt;
-stmt.statementName = "get_user";
-stmt.statement     = "SELECT login, email FROM users WHERE login = $1";
-stmt.variables     = { pg::VARCHAR };
-pool.prepareStatement(stmt);
+    // Create table
+    db.execRawSync(
+        "CREATE TABLE IF NOT EXISTS account ("
+        "  login VARCHAR PRIMARY KEY,"
+        "  password VARCHAR NOT NULL,"
+        "  email VARCHAR NOT NULL"
+        ")");
 
-// Synchronous query
-auto [ok, rows] = pool.querySync<std::tuple<std::string, std::string>>(
-    "get_user", std::string("alice"));
+    // Prepare statements
+    db.prepareStatement({"insert_account",
+        "INSERT INTO account (login, password, email) VALUES ($1, $2, $3)",
+        { pg::VARCHAR, pg::VARCHAR, pg::VARCHAR }});
 
-if (ok) {
-    for (auto& [login, email] : rows)
-        std::cout << login << " — " << email << "\n";
+    db.prepareStatement({"find_account",
+        "SELECT login, password, email FROM account WHERE login = $1",
+        { pg::VARCHAR }});
+
+    // Insert a user
+    std::string user = "alice", pass = "secret123", email = "alice@example.com";
+    bool ok = db.execSync("insert_account", user, pass, email);
+    std::cout << "Insert: " << (ok ? "ok" : "failed") << "\n";
+
+    // Query back
+    using Row = std::tuple<std::string, std::string, std::string>;
+    auto [found, rows] = db.querySync<Row>("find_account", user);
+
+    for (auto& [login, pw, mail] : rows)
+        std::cout << login << " / " << mail << "\n";
+
+    db.shutdown();
 }
-
-pool.shutdown();
 ```
 
-## API
+## API Overview
 
-All query APIs use prepared statement names. Parameters must be `std::string`.
+All prepared statement APIs take the statement name and `std::string` parameters.
 
 ### Synchronous (blocking)
 
 ```cpp
-bool ok = pool.execSync("insert_user", login, password, email);
+// INSERT / UPDATE / DELETE
+bool ok = db.execSync("insert_account", login, password, email);
 
-auto [ok, rows] = pool.querySync<std::tuple<std::string, int>>(
-    "get_scores", username);
+// SELECT
+using Row = std::tuple<std::string, std::string>;
+auto [ok, rows] = db.querySync<Row>("find_account", login);
 ```
 
 ### Future-based
 
 ```cpp
-auto future = pool.execAsync("insert_user", login, password, email);
-// ... do other work ...
-auto result = future.get();  // std::optional<bool>
+// Fire the query, do other work, then collect
+auto f = db.execAsync("insert_account", login, password, email);
+// ... do something else ...
+auto result = f.get();  // std::optional<bool>
 
-auto future = pool.queryAsync<std::tuple<std::string, int>>("get_scores", username);
-auto [ok, rows] = future.get();
+using Row = std::tuple<std::string, int>;
+auto f2 = db.queryAsync<Row>("get_player_stats", login);
+auto [ok, rows] = f2.get();
 ```
 
 ### Callback-based
 
-Callback runs on a worker thread — no blocking, no extra threads.
+Callback runs directly on the DB worker thread — no blocking, no extra threads.
 
 ```cpp
-pool.exec("insert_user", [](std::optional<bool> ok) {
-    if (ok && *ok) std::cout << "inserted\n";
-}, login, password, email);
-
-pool.query<std::tuple<std::string, int>>("get_scores",
-    [](std::optional<bool> ok, std::vector<std::tuple<std::string, int>> rows) {
-        for (auto& [name, score] : rows)
-            std::cout << name << ": " << score << "\n";
-    }, username);
+db.exec("delete_account", [](std::optional<bool> ok) {
+    if (ok && *ok)
+        std::cout << "Account deleted\n";
+}, login, password);
 ```
 
 ### C++20 Coroutines
@@ -109,24 +125,33 @@ pool.query<std::tuple<std::string, int>>("get_scores",
 ```cpp
 #include <pgpp_coroutines.h>
 
-FireAndForget doWork(PgppPool& pool) {
-    // Execute (INSERT/UPDATE/DELETE)
-    auto ok = co_await coExec(pool, "insert_user", login, pw, email);
+// FireAndForget starts immediately, self-destructs on completion
+FireAndForget authenticateUser(PgppPool& db, std::string login,
+                               std::string password,
+                               std::function<void(bool)> onResult)
+{
+    using Row = std::tuple<std::string, std::string>;
+    auto [ok, rows] = co_await coQuery<Row>(db, "find_account", login);
 
-    // Query (SELECT)
-    auto [ok, rows] = co_await coQuery<std::tuple<std::string, std::string>>(
-        pool, "get_user", login);
+    if (!ok || !*ok || rows.empty()) {
+        onResult(false);
+        co_return;
+    }
+
+    auto& [dbLogin, dbPassword] = rows[0];
+    onResult(dbPassword == password);
 }
 ```
 
 ### Raw SQL
 
-For DDL, migrations, or any non-prepared query:
+For schema setup, migrations, or any non-prepared query:
 
 ```cpp
-pool.execRawSync("CREATE TABLE IF NOT EXISTS users (login TEXT PRIMARY KEY, email TEXT)");
+db.execRawSync("CREATE INDEX IF NOT EXISTS idx_account_email ON account(email)");
 
-auto future = pool.execRawAsync("DROP TABLE IF EXISTS temp_data");
+// Async variant
+auto f = db.execRawAsync("VACUUM ANALYZE account");
 ```
 
 ### Transactions
@@ -134,17 +159,33 @@ auto future = pool.execRawAsync("DROP TABLE IF EXISTS temp_data");
 Auto-commits on success, auto-rollbacks on exception:
 
 ```cpp
-auto future = pool.transaction([&](PgppConnection& conn) {
-    conn.execRaw("UPDATE accounts SET balance = balance - 100 WHERE id = '1'");
-    conn.execRaw("UPDATE accounts SET balance = balance + 100 WHERE id = '2'");
+auto f = db.transaction([&](PgppConnection& conn) {
+    conn.execRaw("UPDATE wallet SET balance = balance - 100 WHERE user_id = '1'");
+    conn.execRaw("UPDATE wallet SET balance = balance + 100 WHERE user_id = '2'");
+    // exception here → automatic ROLLBACK
 });
 
-auto result = future.get();  // false if rolled back
+bool committed = f.get().value_or(false);
+```
+
+## Statement Preparation
+
+Statements are prepared once and available on all pool connections.
+Call `prepareStatement` before using `exec`/`query` APIs.
+
+```cpp
+db.prepareStatement({
+    "get_leaderboard",                                    // name
+    "SELECT login, score FROM scores "
+    "ORDER BY score DESC LIMIT $1",                       // SQL with $N params
+    { pg::INT4 }                                          // parameter OIDs
+});
+
+auto [ok, rows] = db.querySync<std::tuple<std::string, int>>(
+    "get_leaderboard", std::to_string(10));
 ```
 
 ## Type Mapping
-
-Query results are mapped to C++ types via tuple:
 
 | PostgreSQL | C++ type | OID constant |
 |---|---|---|
@@ -153,31 +194,30 @@ Query results are mapped to C++ types via tuple:
 | BIGINT | `int64_t` | `pg::INT8` |
 | SMALLINT | `uint32_t` | `pg::INT2` |
 | REAL | `float` | `pg::FLOAT4` |
-| DOUBLE | `double` | `pg::FLOAT8` |
+| DOUBLE PRECISION | `double` | `pg::FLOAT8` |
 | BOOLEAN | `bool` | — |
 
-NULL values are left at default (empty string, 0, false).
+NULL values are left at their C++ default (empty string, 0, false).
 
 ## Pool Statistics
 
 ```cpp
-pool.totalConnections();  // pool size
-pool.freeConnections();   // idle workers
-pool.busyConnections();   // active queries
-pool.queuedRequests();    // waiting in queue
+db.totalConnections();  // pool size
+db.freeConnections();   // idle workers
+db.busyConnections();   // executing queries
+db.queuedRequests();    // waiting in queue
 ```
 
 ## Logging
 
-By default, pgpp compiles with no logging (zero overhead). If your project provides the [alog](https://github.com/ihor-drachuk/alog) target, logging is enabled automatically:
+By default, pgpp compiles with **no logging** (zero overhead). If your project provides the [alog](https://github.com/ihor-drachuk/alog) target, logging is enabled automatically:
 
 ```cmake
-# pgpp detects the alog target and enables logging
-FetchContent_MakeAvailable(alog)
-FetchContent_MakeAvailable(pgpp)
+FetchContent_MakeAvailable(alog)   # provide alog first
+FetchContent_MakeAvailable(pgpp)   # pgpp detects it
 ```
 
-For simple stderr output without alog, define `PGPP_USE_STDERR`:
+For simple stderr output without alog:
 
 ```cmake
 target_compile_definitions(pgpp PRIVATE PGPP_USE_STDERR)
