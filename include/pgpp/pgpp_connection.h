@@ -26,11 +26,7 @@
 #include <vector>
 #include <tuple>
 
-#ifdef _WIN32
 #include <libpq-fe.h>
-#else
-#include <postgresql/libpq-fe.h>
-#endif
 
 typedef struct pg_conn PGconn;
 typedef struct pg_result PGresult;

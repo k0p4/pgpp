@@ -190,7 +190,7 @@ void PgppPool::exec(const std::string& statement,
     if (m_shuttingDown.load()) [[unlikely]] { onDone(std::nullopt); return; }
 
     auto request = std::make_unique<PgppRequest>();
-    request->task = [statement, onDone = std::move(onDone), args...](PgppConnection* conn) mutable {
+    request->task = [statement, onDone, args...](PgppConnection* conn) mutable {
         if (!conn) { onDone(std::nullopt); return; }
         onDone(conn->execPrepared(statement, args...));
     };
@@ -205,7 +205,7 @@ void PgppPool::query(const std::string& statement,
     if (m_shuttingDown.load()) [[unlikely]] { onDone(std::nullopt, {}); return; }
 
     auto request = std::make_unique<PgppRequest>();
-    request->task = [statement, onDone = std::move(onDone), args...](PgppConnection* conn) mutable {
+    request->task = [statement, onDone, args...](PgppConnection* conn) mutable {
         if (!conn) { onDone(std::nullopt, {}); return; }
         std::vector<RowTuple> rows;
         bool ok = conn->execPrepared(statement, rows, args...);
