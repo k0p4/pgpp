@@ -48,7 +48,7 @@ bool PgppConnection::isOpen() const
     return m_connection != nullptr && PQstatus(m_connection) == CONNECTION_OK;
 }
 
-const std::string PgppConnection::lastError() const
+std::string PgppConnection::lastError() const
 {
     if (m_connection) return PQerrorMessage(m_connection);
     return "";

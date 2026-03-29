@@ -87,7 +87,7 @@ public:
     void reset();
     void close();
 
-    const std::string lastError() const;
+    std::string lastError() const;
 
     bool prepare(const Statement& statement);
     bool isPrepared(const std::string& statementName);
@@ -189,10 +189,11 @@ bool PgppConnection::execPrepared(const std::string& statement, std::vector<std:
     }
 
     int rows = PQntuples(queryResult.get());
+    result.reserve(result.size() + rows);
     for (int idx = 0; idx < rows; idx++) {
         std::tuple<TAs...> row;
         Internal::Details::fillTupleFromPQValues(queryResult.get(), idx, row, std::make_index_sequence<sizeof...(TAs)>{});
-        result.push_back(row);
+        result.push_back(std::move(row));
     }
     return true;
 }

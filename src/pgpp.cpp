@@ -27,7 +27,7 @@ static std::string escapeConnValue(const std::string& v)
     out.reserve(v.size() + 4);
     out += '\'';
     for (char c : v) {
-        if (c == '\'') out += '\'';
+        if (c == '\'' || c == '\\') out += '\\';
         out += c;
     }
     out += '\'';
@@ -61,6 +61,9 @@ std::string PgppPool::buildConnectionString(const PgppConnectionInfo& dbInfo) co
 
     if (!dbInfo.sslmode.empty())
         connStr += "sslmode=" + escapeConnValue(dbInfo.sslmode) + " ";
+
+    if (!dbInfo.options.empty())
+        connStr += "options=" + escapeConnValue(dbInfo.options) + " ";
 
     PGPP_LOGD << "Connection: host=\"" << dbInfo.host
               << "\" port=" << dbInfo.port
@@ -188,6 +191,8 @@ bool PgppPool::initialize(const PgppConnectionInfo& dbInfo, size_t poolSize)
         PGPP_LOGW << "Already initialized";
         return true;
     }
+
+    m_shuttingDown.store(false);
 
     if (poolSize > 0) [[likely]] m_poolSize = poolSize;
 
