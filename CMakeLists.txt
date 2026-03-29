@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 project(pgpp LANGUAGES CXX)
 
-set(PostgreSQL_ADDITIONAL_VERSIONS "15")
+set(PostgreSQL_ADDITIONAL_VERSIONS "17" "16" "15" "14" "13")
 find_package(PostgreSQL REQUIRED)
 
 add_library(pgpp STATIC
@@ -14,6 +14,7 @@ add_library(pgpp STATIC
 )
 
 set_property(TARGET pgpp PROPERTY CXX_STANDARD 20)
+set_property(TARGET pgpp PROPERTY CXX_STANDARD_REQUIRED ON)
 
 target_include_directories(pgpp
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include

@@ -139,7 +139,7 @@ target_compile_definitions(pgpp PRIVATE PGPP_USE_STDERR)
 | VARCHAR, TEXT | `std::string` | `pg::VARCHAR`, `pg::TEXT` |
 | INTEGER | `int` | `pg::INT4` |
 | BIGINT | `int64_t` | `pg::INT8` |
-| SMALLINT | `uint32_t` | `pg::INT2` |
+| SMALLINT | `int16_t` | `pg::INT2` |
 | REAL | `float` | `pg::FLOAT4` |
 | DOUBLE PRECISION | `double` | `pg::FLOAT8` |
 | BOOLEAN | `bool` | — |

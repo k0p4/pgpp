@@ -36,7 +36,7 @@ Requires PostgreSQL development headers (`libpq-dev` / `postgresql-devel`).
 #include <pgpp/pgpp.h>
 
 PgppPool db;
-db.initialize({.host = "127.0.0.1", .dbname = "mydb", .user = "postgres", .password = "secret"}, 4);
+db.initialize({.dbname = "mydb", .host = "127.0.0.1", .user = "postgres", .password = "secret"}, 4);
 
 db.prepareStatement({"insert_user",
     "INSERT INTO users (name, email) VALUES ($1, $2)",
@@ -77,7 +77,7 @@ See the [Usage Guide](docs/usage.md) for detailed API reference, coroutine examp
 | VARCHAR, TEXT | `std::string` | `pg::VARCHAR`, `pg::TEXT` |
 | INTEGER | `int` | `pg::INT4` |
 | BIGINT | `int64_t` | `pg::INT8` |
-| SMALLINT | `uint32_t` | `pg::INT2` |
+| SMALLINT | `int16_t` | `pg::INT2` |
 | REAL / DOUBLE | `float` / `double` | `pg::FLOAT4` / `pg::FLOAT8` |
 | BOOLEAN | `bool` | — |
 

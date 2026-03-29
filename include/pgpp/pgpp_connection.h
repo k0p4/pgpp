@@ -122,6 +122,9 @@ std::string convertPQValue(const char* raw) { return raw; }
 template<typename T, std::enable_if_t<std::is_same_v<T, int>>* = nullptr>
 int convertPQValue(const char* raw) { return std::stoi(raw); }
 
+template<typename T, std::enable_if_t<std::is_same_v<T, int16_t> && !std::is_same_v<int16_t, int>>* = nullptr>
+int16_t convertPQValue(const char* raw) { return static_cast<int16_t>(std::stoi(raw)); }
+
 template<typename T, std::enable_if_t<std::is_same_v<T, int64_t> && !std::is_same_v<int64_t, int>>* = nullptr>
 int64_t convertPQValue(const char* raw) { return std::stoll(raw); }
 
