@@ -116,7 +116,9 @@ private:
     std::atomic<bool>         m_initialized  { false };
     std::atomic<size_t>       m_busyWorkers  { 0 };
 
+    mutable std::mutex     m_stmtMutex;
     std::vector<Statement> m_preparedStatements;
+    std::atomic<uint32_t>  m_stmtVersion { 0 };
 
     bool createConnections(const PgppConnectionInfo& dbInfo);
     void startWorkerThreads();

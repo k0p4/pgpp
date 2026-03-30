@@ -48,6 +48,9 @@ namespace pg {
     constexpr uint32_t TIMETZ       = 1266;
 }
 
+// Legacy macros — prefer pg:: namespace constants directly.
+// Define PGPP_ENABLE_OID_MACROS before including to enable.
+#ifdef PGPP_ENABLE_OID_MACROS
 #define BYTEAOID        pg::BYTEA
 #define CHAROID         pg::CHAR
 #define INT8OID         pg::INT8
@@ -62,6 +65,7 @@ namespace pg {
 #define TIMESTAMPOID    pg::TIMESTAMP
 #define TIMESTAMPTZOID  pg::TIMESTAMPTZ
 #define TIMETZOID       pg::TIMETZ
+#endif
 
 struct Statement {
     std::string statementName;

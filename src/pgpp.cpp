@@ -99,7 +99,12 @@ bool PgppPool::createConnections(const PgppConnectionInfo& dbInfo)
 
 void PgppPool::prepareStatementsOnConnection(PgppConnection* conn)
 {
-    for (const auto& stmt : m_preparedStatements) {
+    std::vector<Statement> stmts;
+    {
+        std::lock_guard<std::mutex> lock(m_stmtMutex);
+        stmts = m_preparedStatements;
+    }
+    for (const auto& stmt : stmts) {
         if (!conn->prepare(stmt)) [[unlikely]]
             PGPP_LOGW << "Failed to prepare: " << stmt.statementName;
     }
@@ -124,19 +129,28 @@ void PgppPool::stopWorkerThreads()
 void PgppPool::workerLoop(size_t connIdx)
 {
     PgppConnection* conn = m_connections[connIdx].get();
+    uint32_t localStmtVersion = m_stmtVersion.load(std::memory_order_acquire);
 
     while (!m_shuttingDown.load()) {
         std::unique_ptr<PgppRequest> request;
         {
             std::unique_lock<std::mutex> lock(m_queueMutex);
-            m_requestQueued.wait(lock, [this] {
-                return !m_requestQueue.empty() || m_shuttingDown.load();
+            m_requestQueued.wait(lock, [this, localStmtVersion] {
+                return !m_requestQueue.empty() || m_shuttingDown.load()
+                    || m_stmtVersion.load(std::memory_order_acquire) != localStmtVersion;
             });
             if (m_shuttingDown.load()) [[unlikely]] break;
             if (!m_requestQueue.empty()) [[likely]] {
                 request = std::move(m_requestQueue.front());
                 m_requestQueue.pop();
             }
+        }
+
+        // Check if new statements need preparing on this connection
+        uint32_t currentVersion = m_stmtVersion.load(std::memory_order_acquire);
+        if (currentVersion != localStmtVersion) {
+            localStmtVersion = currentVersion;
+            prepareStatementsOnConnection(conn);
         }
 
         if (!request) [[unlikely]] continue;
@@ -212,13 +226,18 @@ void PgppPool::shutdown()
 
     stopWorkerThreads();
 
+    // Drain pending requests outside the lock to avoid deadlock:
+    // task(nullptr) resumes coroutines which may call enqueueRaw.
+    std::vector<std::unique_ptr<PgppRequest>> pending;
     {
         std::lock_guard<std::mutex> lock(m_queueMutex);
         while (!m_requestQueue.empty()) {
-            auto req = std::move(m_requestQueue.front());
+            pending.push_back(std::move(m_requestQueue.front()));
             m_requestQueue.pop();
-            try { req->task(nullptr); } catch (...) {}
         }
+    }
+    for (auto& req : pending) {
+        try { req->task(nullptr); } catch (...) {}
     }
 
     m_connections.clear();
@@ -229,7 +248,10 @@ bool PgppPool::isInitialized() const { return m_initialized.load(); }
 
 void PgppPool::prepareStatement(const Statement& statement)
 {
-    m_preparedStatements.push_back(statement);
+    {
+        std::lock_guard<std::mutex> lock(m_stmtMutex);
+        m_preparedStatements.push_back(statement);
+    }
 
     if (m_workerThreads.empty()) {
         for (auto& conn : m_connections) {
@@ -237,13 +259,9 @@ void PgppPool::prepareStatement(const Statement& statement)
                 PGPP_LOGW << "Failed to prepare: " << statement.statementName;
         }
     } else {
-        for (size_t i = 0; i < m_poolSize; ++i) {
-            auto req = std::make_unique<PgppRequest>();
-            req->task = [stmt = statement](PgppConnection* conn) {
-                if (conn) conn->prepare(stmt);
-            };
-            enqueueRaw(std::move(req));
-        }
+        // Wake all workers — each will check m_stmtVersion and re-prepare.
+        m_stmtVersion.fetch_add(1, std::memory_order_release);
+        m_requestQueued.notify_all();
     }
 }
 
