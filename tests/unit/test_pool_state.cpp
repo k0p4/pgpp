@@ -100,7 +100,27 @@ TEST(PoolState, EnqueueRawOnUninitializedPool)
     request->task = [&called](PgppConnection*) { called = true; };
 
     bool enqueued = pool.enqueueRaw(std::move(request));
-    // Pool not initialized — enqueue may or may not work depending on shutdown state.
-    // But it should not crash.
-    (void)enqueued;
+    EXPECT_FALSE(enqueued);  // m_initialized is false — must reject
+    EXPECT_FALSE(called);    // task should never have been invoked
+}
+
+// ── Additional: async operations on uninitialized pool return immediately ───
+
+TEST(PoolState, AsyncOnUninitializedPoolReturnsNullopt)
+{
+    PgppPool pool;
+
+    auto future = pool.execAsync("nonexistent", std::string("arg"));
+    auto result = future.get();
+    EXPECT_FALSE(result.has_value());  // nullopt — pool not initialized
+
+    using Row = std::tuple<std::string>;
+    auto future2 = pool.queryAsync<Row>("nonexistent", std::string("arg"));
+    auto [ok, rows] = future2.get();
+    EXPECT_FALSE(ok.has_value());
+    EXPECT_TRUE(rows.empty());
+
+    auto future3 = pool.execRawAsync("SELECT 1");
+    auto result3 = future3.get();
+    EXPECT_FALSE(result3.has_value());
 }

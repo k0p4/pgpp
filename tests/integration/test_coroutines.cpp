@@ -84,3 +84,36 @@ TEST_F(PgppIntegrationTest, FireAndForgetSelfDestructs)
 
     EXPECT_EQ(completionCount.load(), 10);
 }
+
+// ── Missing: backward compat aliases coExecPrepared / coExecPreparedWithResult
+
+TEST_F(PgppIntegrationTest, CoExecPreparedBackwardCompat)
+{
+    pool.prepareStatement({"compat_ins", "INSERT INTO pgpp_test_table (name) VALUES ($1)", {pg::VARCHAR}});
+    pool.prepareStatement({"compat_sel", "SELECT name FROM pgpp_test_table WHERE name = $1", {pg::VARCHAR}});
+
+    std::atomic<bool> done { false };
+    std::optional<bool> execResult;
+    std::vector<std::tuple<std::string>> queryRows;
+
+    auto coro = [&]() -> FireAndForget {
+        // Test coExecPrepared alias
+        execResult = co_await coExecPrepared(pool, "compat_ins", std::string("compat_user"));
+
+        // Test coExecPreparedWithResult alias
+        using Row = std::tuple<std::string>;
+        auto [ok, rows] = co_await coExecPreparedWithResult<Row>(pool, "compat_sel", std::string("compat_user"));
+        queryRows = std::move(rows);
+        done.store(true);
+    };
+    coro();
+
+    for (int i = 0; i < 50 && !done.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    ASSERT_TRUE(done.load());
+    ASSERT_TRUE(execResult.has_value());
+    EXPECT_TRUE(execResult.value());
+    ASSERT_EQ(queryRows.size(), 1u);
+    EXPECT_EQ(std::get<0>(queryRows[0]), "compat_user");
+}

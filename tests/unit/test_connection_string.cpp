@@ -57,17 +57,14 @@ TEST_F(PgppPoolTest, BuildConnectionStringEscapesSpecialChars)
     info.dbname   = "testdb";
     info.host     = "localhost";
     info.user     = "admin";
-    info.password = "pass'word\\with\"special";
+    info.password = "pass'word\\end";
 
     std::string result = build(info);
 
-    // Single quotes and backslashes should be escaped
-    // The password field should contain escaped versions
-    EXPECT_NE(result.find("password="), std::string::npos);
-    // Original unescaped chars should NOT appear bare
-    // (they should be preceded by backslash)
-    EXPECT_NE(result.find("\\'"), std::string::npos);
-    EXPECT_NE(result.find("\\\\"), std::string::npos);
+    // Password field must contain escaped single-quote and backslash inside single quotes
+    // Expected: password='pass\'word\\end'
+    EXPECT_NE(result.find("password='pass\\'word\\\\end'"), std::string::npos)
+        << "Actual connection string: " << result;
 }
 
 // ── Additional edge cases ───────────────────────────────────────────────────

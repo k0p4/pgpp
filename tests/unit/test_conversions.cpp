@@ -88,3 +88,31 @@ TEST(TypeConversions, BoolFalseValues)
     EXPECT_FALSE(convertPQValue<bool>("F"));
     EXPECT_FALSE(convertPQValue<bool>("0"));
 }
+
+// ── Edge cases: malformed input ─────────────────────────────────────────────
+
+TEST(TypeConversions, IntThrowsOnEmptyString)
+{
+    EXPECT_THROW(convertPQValue<int>(""), std::invalid_argument);
+}
+
+TEST(TypeConversions, IntThrowsOnNonNumeric)
+{
+    EXPECT_THROW(convertPQValue<int>("abc"), std::invalid_argument);
+}
+
+TEST(TypeConversions, DoubleThrowsOnEmptyString)
+{
+    EXPECT_THROW(convertPQValue<double>(""), std::invalid_argument);
+}
+
+TEST(TypeConversions, Uint32ParsesMaxValue)
+{
+    EXPECT_EQ(convertPQValue<uint32_t>("4294967295"), 4294967295U);
+}
+
+TEST(TypeConversions, Int64ParsesMinValue)
+{
+    // INT64_MIN + 1 to avoid literal issues
+    EXPECT_EQ(convertPQValue<int64_t>("-9223372036854775807"), -9223372036854775807LL);
+}

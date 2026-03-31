@@ -108,22 +108,45 @@ TEST_F(PgppIntegrationTest, PoolConcurrentQueries)
 
     EXPECT_EQ(successCount.load(), numThreads * queriesPerThread);
 
-    // Verify all rows exist
-    auto [ok, rows] = pool.querySync<std::tuple<std::string>>(
-        "SELECT name FROM pgpp_test_table");
-    // This uses raw query since we didn't prepare a "select all"
-    // Let's just check via execRawSync
+    // Verify all rows actually exist in the database
+    pool.prepareStatement({"conc_count", "SELECT COUNT(*) FROM pgpp_test_table", {}});
+    auto [ok, countRows] = pool.querySync<std::tuple<int>>("conc_count");
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(countRows.size(), 1u);
+    EXPECT_EQ(std::get<0>(countRows[0]), numThreads * queriesPerThread);
 }
 
 // ── IT-POOL-008: pool statistics ────────────────────────────────────────────
 
-TEST_F(PgppIntegrationTest, PoolStatistics)
+TEST_F(PgppIntegrationTest, PoolStatisticsIdle)
 {
     EXPECT_EQ(pool.totalConnections(), 2u);
-    // When idle, all connections should be free
-    EXPECT_GE(pool.freeConnections(), 0u);
-    EXPECT_LE(pool.busyConnections(), 2u);
-    EXPECT_GE(pool.queuedRequests(), 0u);
+    EXPECT_EQ(pool.busyConnections(), 0u);
+    EXPECT_EQ(pool.freeConnections(), 2u);
+    EXPECT_EQ(pool.queuedRequests(), 0u);
+    // Invariant: busy + free == total
+    EXPECT_EQ(pool.busyConnections() + pool.freeConnections(), pool.totalConnections());
+}
+
+TEST_F(PgppIntegrationTest, PoolStatisticsUnderLoad)
+{
+    pool.prepareStatement({"stat_slow", "SELECT pg_sleep(0.5)", {}});
+
+    // Fire queries to saturate both connections
+    auto f1 = pool.execAsync("stat_slow");
+    auto f2 = pool.execAsync("stat_slow");
+    // These will queue since both workers are busy
+    auto f3 = pool.execAsync("stat_slow");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Under load: both workers busy, 1 queued
+    EXPECT_EQ(pool.busyConnections(), 2u);
+    EXPECT_EQ(pool.freeConnections(), 0u);
+    EXPECT_GE(pool.queuedRequests(), 1u);
+    EXPECT_EQ(pool.busyConnections() + pool.freeConnections(), pool.totalConnections());
+
+    f1.get(); f2.get(); f3.get();
 }
 
 // ── IT-POOL-009: shutdown with pending requests ─────────────────────────────
@@ -147,10 +170,11 @@ TEST(PoolShutdown, PendingRequestsGetNullopt)
     // Shutdown while queries are pending
     pool.shutdown();
 
-    // Slow query and pending should resolve to nullopt or false
+    // Pending futures must resolve (not hang) and return nullopt or false
     for (auto& f : pending) {
         auto result = f.get();
-        // Either nullopt (shutdown) or false (error) — just shouldn't hang
+        EXPECT_TRUE(!result.has_value() || !result.value())
+            << "Pending request after shutdown should be nullopt or false";
     }
 }
 
@@ -165,4 +189,63 @@ TEST_F(PgppIntegrationTest, PoolPrepareOnRunningPool)
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     EXPECT_TRUE(pool.execSync("runtime_stmt", std::string("runtime_user")));
+}
+
+// ── Missing: pool.query callback API ────────────────────────────────────────
+
+TEST_F(PgppIntegrationTest, PoolQueryCallback)
+{
+    pool.execRawSync("INSERT INTO pgpp_test_table (name, score) VALUES ('cb_query_user', 55)");
+    pool.prepareStatement({"cb_query", "SELECT name, score FROM pgpp_test_table WHERE name = $1", {pg::VARCHAR}});
+
+    std::promise<void> done;
+    std::optional<bool> callbackOk;
+    std::vector<std::tuple<std::string, int>> callbackRows;
+
+    using Row = std::tuple<std::string, int>;
+    pool.query<Row>("cb_query",
+        [&](std::optional<bool> ok, std::vector<Row> rows) {
+            callbackOk = ok;
+            callbackRows = std::move(rows);
+            done.set_value();
+        },
+        std::string("cb_query_user"));
+
+    done.get_future().wait();
+
+    ASSERT_TRUE(callbackOk.has_value());
+    EXPECT_TRUE(callbackOk.value());
+    ASSERT_EQ(callbackRows.size(), 1u);
+    EXPECT_EQ(std::get<0>(callbackRows[0]), "cb_query_user");
+    EXPECT_EQ(std::get<1>(callbackRows[0]), 55);
+}
+
+// ── Missing: duplicate prepareStatement ─────────────────────────────────────
+
+TEST_F(PgppIntegrationTest, DuplicatePrepareStatementHandled)
+{
+    // Prepare same name twice — PostgreSQL will reject the second prepare
+    // on the same connection, but pool should handle it gracefully
+    pool.prepareStatement({"dup_stmt", "INSERT INTO pgpp_test_table (name) VALUES ($1)", {pg::VARCHAR}});
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Second prepare with same name — should not crash
+    pool.prepareStatement({"dup_stmt", "INSERT INTO pgpp_test_table (name) VALUES ($1)", {pg::VARCHAR}});
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Statement should still work
+    EXPECT_TRUE(pool.execSync("dup_stmt", std::string("dup_test_user")));
+}
+
+// ── Missing: execPrepared with zero args ────────────────────────────────────
+
+TEST_F(PgppIntegrationTest, PoolExecZeroArgs)
+{
+    pool.execRawSync("INSERT INTO pgpp_test_table (name, score) VALUES ('zero_args', 1)");
+    pool.prepareStatement({"zero_sel", "SELECT name FROM pgpp_test_table", {}});
+
+    using Row = std::tuple<std::string>;
+    auto [ok, rows] = pool.querySync<Row>("zero_sel");
+    EXPECT_TRUE(ok);
+    EXPECT_GE(rows.size(), 1u);
 }
