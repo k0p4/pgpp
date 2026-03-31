@@ -13,6 +13,19 @@ TEST_F(PgppIntegrationTest, PoolInitializeWithConnections)
     EXPECT_TRUE(pool.isInitialized());
 }
 
+// Verify double-initialize on an already-running pool returns true (idempotent)
+TEST_F(PgppIntegrationTest, DoubleInitializeReturnsTrueWhenAlreadyRunning)
+{
+    // pool is already initialized by fixture's SetUp
+    ASSERT_TRUE(pool.isInitialized());
+
+    // Second call hits the atomic guard: m_initialized.exchange(true) returns true → return true
+    EXPECT_TRUE(pool.initialize(connInfo, 2));
+    EXPECT_TRUE(pool.isInitialized());
+    // Pool should still work
+    EXPECT_TRUE(pool.execRawSync("SELECT 1"));
+}
+
 // ── IT-POOL-002: execSync INSERT ────────────────────────────────────────────
 
 TEST_F(PgppIntegrationTest, PoolExecSyncInsert)

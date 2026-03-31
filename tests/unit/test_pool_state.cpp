@@ -17,7 +17,7 @@ TEST(PoolState, DefaultPoolSize)
 
 // ── UT-POOL-002: Double initialize is idempotent (atomic guard) ─────────────
 
-TEST(PoolState, DoubleInitializeGuard)
+TEST(PoolState, InitializeFailsWithBadConnection)
 {
     PgppPool pool;
     PgppConnectionInfo info;
@@ -25,13 +25,14 @@ TEST(PoolState, DoubleInitializeGuard)
     info.host   = "127.0.0.1";
     info.port   = 1; // deliberately wrong port — connection will fail
 
-    // First init will fail (can't connect) but should not crash
-    bool first = pool.initialize(info, 1);
-    // Result depends on whether PG is reachable — we just care it doesn't crash
+    // createConnections() fails → m_initialized reset to false → returns false
+    EXPECT_FALSE(pool.initialize(info, 1));
+    EXPECT_FALSE(pool.isInitialized());
 
-    // Second call should return true (already initialized) OR false (first failed, can retry)
-    // Either way, no crash or UB
-    pool.initialize(info, 1);
+    // Since first init failed (m_initialized was reset to false), second attempt
+    // re-enters initialize and also fails — returns false, not "already initialized"
+    EXPECT_FALSE(pool.initialize(info, 1));
+    EXPECT_FALSE(pool.isInitialized());
 
     pool.shutdown();
 }
@@ -80,12 +81,15 @@ TEST(PoolState, ShutdownThenReinitialize)
     info.host   = "127.0.0.1";
     info.port   = 1;
 
-    pool.initialize(info, 1);
+    // First cycle: init fails (bad port), shutdown is no-op (not initialized)
+    EXPECT_FALSE(pool.initialize(info, 1));
+    EXPECT_FALSE(pool.isInitialized());
     pool.shutdown();
+    EXPECT_FALSE(pool.isInitialized());
 
-    // After shutdown, should be able to initialize again
-    // (will fail to connect but should not crash or deadlock)
-    pool.initialize(info, 1);
+    // Second cycle: re-init also fails, but state machine allows retry
+    EXPECT_FALSE(pool.initialize(info, 1));
+    EXPECT_FALSE(pool.isInitialized());
     pool.shutdown();
 }
 
