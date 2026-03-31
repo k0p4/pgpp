@@ -182,6 +182,7 @@ void PgppPool::workerLoop(size_t connIdx)
 
 bool PgppPool::enqueueRaw(std::unique_ptr<PgppRequest> request)
 {
+    if (!m_initialized.load()) [[unlikely]] return false;
     std::lock_guard<std::mutex> lock(m_queueMutex);
     if (m_shuttingDown.load()) [[unlikely]] return false;
     m_requestQueue.push(std::move(request));

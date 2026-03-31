@@ -126,6 +126,10 @@ private:
     void workerLoop(size_t connIdx);
     std::string buildConnectionString(const PgppConnectionInfo& dbInfo) const;
     void prepareStatementsOnConnection(PgppConnection* conn);
+
+#ifdef PGPP_TESTING
+    friend class PgppPoolTest;
+#endif
 };
 
 struct PgppRequest {
