@@ -274,7 +274,11 @@ TEST(PoolSingleConnection, SequentialQueries)
     ASSERT_TRUE(pool.initialize(info, 1));
 
     // Create table (raw TEST — no fixture creates it)
-    pool.execRawSync("DROP TABLE IF EXISTS pgpp_test_table");
+    pool.execRawSync(
+        "DO $$ BEGIN "
+        "SET LOCAL client_min_messages TO WARNING; "
+        "DROP TABLE IF EXISTS pgpp_test_table; "
+        "END $$");
     ASSERT_TRUE(pool.execRawSync(
         "CREATE TABLE pgpp_test_table ("
         "  id SERIAL PRIMARY KEY,"
@@ -297,7 +301,11 @@ TEST(PoolSingleConnection, SequentialQueries)
     ASSERT_EQ(rows.size(), 1u);
     EXPECT_GE(std::get<0>(rows[0]), 5);
 
-    pool.execRawSync("DROP TABLE IF EXISTS pgpp_test_table");
+    pool.execRawSync(
+        "DO $$ BEGIN "
+        "SET LOCAL client_min_messages TO WARNING; "
+        "DROP TABLE IF EXISTS pgpp_test_table; "
+        "END $$");
     pool.shutdown();
 }
 

@@ -22,7 +22,11 @@ protected:
         ASSERT_TRUE(pool.initialize(connInfo, 2))
             << "Cannot connect to PostgreSQL. Set PGPP_TEST_* env vars.";
 
-        pool.execRawSync("DROP TABLE IF EXISTS pgpp_test_table");
+        pool.execRawSync(
+            "DO $$ BEGIN "
+            "SET LOCAL client_min_messages TO WARNING; "
+            "DROP TABLE IF EXISTS pgpp_test_table; "
+            "END $$");
         ASSERT_TRUE(pool.execRawSync(
             "CREATE TABLE pgpp_test_table ("
             "  id SERIAL PRIMARY KEY,"
@@ -35,7 +39,11 @@ protected:
 
     void TearDown() override
     {
-        pool.execRawSync("DROP TABLE IF EXISTS pgpp_test_table");
+        pool.execRawSync(
+            "DO $$ BEGIN "
+            "SET LOCAL client_min_messages TO WARNING; "
+            "DROP TABLE IF EXISTS pgpp_test_table; "
+            "END $$");
         pool.shutdown();
     }
 };
@@ -59,7 +67,11 @@ protected:
         ASSERT_TRUE(conn.open(connString))
             << "Cannot connect to PostgreSQL. Set PGPP_TEST_* env vars.";
 
-        conn.execRaw("DROP TABLE IF EXISTS pgpp_test_table");
+        conn.execRaw(
+            "DO $$ BEGIN "
+            "SET LOCAL client_min_messages TO WARNING; "
+            "DROP TABLE IF EXISTS pgpp_test_table; "
+            "END $$");
         ASSERT_TRUE(conn.execRaw(
             "CREATE TABLE pgpp_test_table ("
             "  id SERIAL PRIMARY KEY,"
@@ -72,7 +84,11 @@ protected:
 
     void TearDown() override
     {
-        conn.execRaw("DROP TABLE IF EXISTS pgpp_test_table");
+        conn.execRaw(
+            "DO $$ BEGIN "
+            "SET LOCAL client_min_messages TO WARNING; "
+            "DROP TABLE IF EXISTS pgpp_test_table; "
+            "END $$");
         conn.close();
     }
 };

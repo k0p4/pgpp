@@ -4,6 +4,7 @@
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -51,15 +52,32 @@ def log(msg=""):
     print(msg, flush=True)
 
 
-def run(cmd, label):
+def run(cmd, label, timeout=None):
     """Run a command, streaming output. Returns exit code."""
     log(f"\n{'='*60}")
     log(f"  {label}")
     log(f"{'='*60}\n")
-    result = subprocess.run(cmd)
+    try:
+        result = subprocess.run(cmd, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log(f"\n  TIMEOUT: {label} (exceeded {timeout}s)")
+        return 1
     if result.returncode != 0:
         log(f"\n  FAILED: {label} (exit code {result.returncode})")
     return result.returncode
+
+
+def get_docker_image():
+    """Parse DOCKER_IMAGE from test_config.h. Returns image name or None."""
+    config = SCRIPT_DIR / "tests" / "common" / "test_config.h"
+    if not config.exists():
+        log("  Warning: test_config.h not found, skipping docker pull")
+        return None
+    matches = re.findall(r'DOCKER_IMAGE\s*=\s*"([^"]+)"', config.read_text())
+    if len(matches) != 1:
+        log(f"  Warning: expected 1 DOCKER_IMAGE in test_config.h, found {len(matches)}, skipping docker pull")
+        return None
+    return matches[0]
 
 
 def main():
@@ -173,32 +191,32 @@ def main():
     # --- Tests ---
 
     if not args.skip_tests:
-        if use_presets:
-            rc = run(
-                ["ctest", "--preset", args.preset, "-R", "pgpp_unit_tests"],
-                "Unit tests",
-            )
-        else:
-            rc = run(
-                ["ctest", "--test-dir", str(build_dir), "-C", build_type,
-                 "--output-on-failure", "-R", "pgpp_unit_tests"],
-                "Unit tests",
-            )
-        if rc != 0:
-            return rc
+        # Pre-pull Docker image so that the first integration run
+        # doesn't blow the test timeout downloading it
+        if has_docker and not skip_integration:
+            image = get_docker_image()
+            if image:
+                rc = run(["docker", "pull", image],
+                         "Docker image pull (warmup)")
+                if rc != 0:
+                    log("  Warning: docker pull failed, integration tests may fail")
 
-        if not skip_integration:
-            if use_presets:
-                rc = run(
-                    ["ctest", "--preset", args.preset, "-R", "pgpp_integration_tests"],
-                    "Integration tests",
-                )
+        # Run test executables directly (not via CTest) for full GoogleTest output
+        for test_name, exe_name, timeout in [
+            ("Unit tests", "pgpp_unit_tests", 20),
+            ("Integration tests", "pgpp_integration_tests", 60),
+        ]:
+            if exe_name == "pgpp_integration_tests" and skip_integration:
+                continue
+
+            if sys.platform == "win32":
+                exe = build_dir / "tests" / build_type / f"{exe_name}.exe"
             else:
-                rc = run(
-                    ["ctest", "--test-dir", str(build_dir), "-C", build_type,
-                     "--output-on-failure", "-R", "pgpp_integration_tests"],
-                    "Integration tests",
-                )
+                exe = build_dir / "tests" / exe_name
+            if not exe.exists():
+                log(f"\n  ERROR: {test_name} executable not found: {exe}")
+                return 1
+            rc = run([str(exe)], test_name, timeout=timeout)
             if rc != 0:
                 return rc
 
