@@ -17,6 +17,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: pgpp_test_pass
+          POSTGRES_DB: pgpp_test
+        ports:
+          - 15432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - name: "Install dependencies"
         run: |
@@ -33,8 +48,16 @@ jobs:
 
       - name: Build
         run: |
-          cmake -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -G "Unix Makefiles" -B build
+          cmake -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -DPGPP_BUILD_TESTS=ON -G "Unix Makefiles" -B build
           cmake --build build --config ${{matrix.build_type}} -j $(nproc)
+
+      - name: "Unit tests"
+        run: ctest --test-dir build -C ${{matrix.build_type}} --output-on-failure -R pgpp_unit_tests
+
+      - name: "Integration tests"
+        env:
+          PGPP_SKIP_DOCKER: "1"
+        run: ctest --test-dir build -C ${{matrix.build_type}} --output-on-failure -R pgpp_integration_tests
 
 
   Build-Windows:
@@ -52,8 +75,11 @@ jobs:
       - name: Build
         shell: bash
         run: |
-          cmake -DPostgreSQL_ROOT="$PGROOT" -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -G "Visual Studio 17 2022" -B build
+          cmake -DPostgreSQL_ROOT="$PGROOT" -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -DPGPP_BUILD_TESTS=ON -G "Visual Studio 17 2022" -B build
           cmake --build build --config ${{matrix.build_type}} -j $NUMBER_OF_PROCESSORS
+
+      - name: "Unit tests"
+        run: ctest --test-dir build -C ${{matrix.build_type}} --output-on-failure -R pgpp_unit_tests
 
 
   Build-MacOS:
@@ -73,8 +99,11 @@ jobs:
 
       - name: Build
         run: |
-          cmake -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -DCMAKE_PREFIX_PATH="$(brew --prefix libpq)" -G "Unix Makefiles" -B build
+          cmake -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -DPGPP_BUILD_TESTS=ON -DCMAKE_PREFIX_PATH="$(brew --prefix libpq)" -G "Unix Makefiles" -B build
           cmake --build build --config ${{matrix.build_type}} -j $(sysctl -n hw.ncpu)
+
+      - name: "Unit tests"
+        run: ctest --test-dir build -C ${{matrix.build_type}} --output-on-failure -R pgpp_unit_tests
 
 
   CodeChecker:
