@@ -17,21 +17,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: pgpp_test_pass
-          POSTGRES_DB: pgpp_test
-        ports:
-          - 15432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-
     steps:
       - name: "Install dependencies"
         run: |
@@ -55,8 +40,6 @@ jobs:
         run: ctest --test-dir build -C ${{matrix.build_type}} --output-on-failure -R pgpp_unit_tests
 
       - name: "Integration tests"
-        env:
-          PGPP_SKIP_DOCKER: "1"
         run: ctest --test-dir build -C ${{matrix.build_type}} --output-on-failure -R pgpp_integration_tests
 
 
@@ -104,6 +87,12 @@ jobs:
 
       - name: "Unit tests"
         run: ctest --test-dir build -C ${{matrix.build_type}} --output-on-failure -R pgpp_unit_tests
+
+      - name: "Setup Docker"
+        uses: docker/setup-docker-action@v5
+
+      - name: "Integration tests"
+        run: ctest --test-dir build -C ${{matrix.build_type}} --output-on-failure -R pgpp_integration_tests
 
 
   CodeChecker:
