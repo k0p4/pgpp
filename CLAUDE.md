@@ -9,13 +9,30 @@ raw SQL, and transactions. Designed for consumption via CMake FetchContent.
 **License:** GPL-3.0-or-later
 **Consumed via:** CMake FetchContent by downstream projects
 
-## Quick Reference
+## Quick Reference (Standalone Development)
+
+Prerequisites: C++20 compiler, CMake 3.16+, `VCPKG_ROOT` environment variable.
+
+```bash
+python build_and_test.py              # full pipeline: configure + build + test
+python build_and_test.py --unit-only  # unit tests only (no Docker needed)
+python build_and_test.py --skip-tests # only configure and build
+```
+
+Or use CMake directly:
 
 | Action | Command |
 |---|---|
-| **Build** | `cd build && cmake .. && cmake --build .` |
-| **Build (Ninja)** | `cd build && cmake -G Ninja .. && ninja` |
-| **Run unit tests** | `cmake --build build --target pgpp_unit_tests && ctest --test-dir build` |
+| **Configure** | `cmake --preset dev-debug` |
+| **Build** | `cmake --build --preset dev-debug` |
+| **Run all tests** | `ctest --preset dev-debug` |
+
+vcpkg manifest (`vcpkg.json`) installs libpq automatically during configure.
+
+## Usage Scenarios
+
+- **Standalone dev**: CMake presets + vcpkg — libpq is provided automatically
+- **FetchContent consumer**: Consumer's project provides `PostgreSQL::PostgreSQL` target; vcpkg.json and presets are ignored
 
 ## Project Structure
 
@@ -29,11 +46,22 @@ pgpp/
     pgpp.cpp              # PgppPool implementation
     pgpp_connection.cpp   # PgppConnection implementation
     pgpp_log.h            # Compile-time logging (alog / stderr / no-op)
+  tests/
+    common/
+      test_config.h       # Test configuration constants, getTestConnectionInfo()
+      docker_fixture.h    # DockerPostgresEnvironment (auto-manage PostgreSQL container)
+    unit/                 # Unit tests (no database needed)
+    integration/
+      main.cpp            # Custom main with Docker environment registration
+      test_fixture.h      # Integration test fixtures
+      test_*.cpp           # Integration test files
   docs/
     SPECIFICATION.md      # Full API specification with requirements (REQ-PGPP-NNN)
     TESTING_ROADMAP.md    # Test plan: unit tests and integration tests
     usage.md              # Usage examples
-  tests/                  # Planned test directory
+  build_and_test.py       # Cross-platform build & test script
+  CMakePresets.json       # Dev presets (vcpkg + tests enabled)
+  vcpkg.json              # vcpkg manifest (libpq dependency)
   CMakeLists.txt
 ```
 
@@ -84,11 +112,12 @@ Single connection wrapper. Used internally by pool workers. Direct use is for te
 
 ## Testing
 
-Tests are planned but not yet implemented. See [docs/TESTING_ROADMAP.md](docs/TESTING_ROADMAP.md).
-
+- **Framework:** GoogleTest v1.14.0 (fetched via FetchContent)
 - **Unit tests:** Type conversions, connection string building, pool state machine (no database needed)
 - **Integration tests:** Full CRUD, pool concurrency, transactions, coroutines (require PostgreSQL)
-- **Framework:** GoogleTest or Catch2 (TBD)
+- **Docker fixture:** Integration tests auto-manage a PostgreSQL container via Docker CLI
+  - Set `PGPP_SKIP_DOCKER=1` to skip Docker management (e.g. when PostgreSQL is already running)
+  - Container: `pgpp-test-pg-7f3a` on port 15432, image `postgres:16-alpine`
 
 ## Downstream Usage
 

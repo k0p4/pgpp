@@ -3,3 +3,5 @@ cmake-build-*/
 .idea/
 *.o
 *.a
+CMakeUserPresets.json
+vcpkg_installed/

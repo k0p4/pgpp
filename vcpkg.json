@@ -1,0 +1,9 @@
+{
+  "name": "pgpp",
+  "version-string": "0.1.0",
+  "description": "C++20 thread-safe PostgreSQL connection pool library",
+  "builtin-baseline": "a9f0cd0345fb29cd227d802f1fd1917c28f8e5a3",
+  "dependencies": [
+    "libpq"
+  ]
+}

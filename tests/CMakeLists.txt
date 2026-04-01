@@ -22,6 +22,7 @@ add_test(NAME pgpp_unit_tests COMMAND pgpp_unit_tests)
 
 # ── Integration tests (require PostgreSQL) ───────────────────────────────────
 add_executable(pgpp_integration_tests
+    integration/main.cpp
     integration/test_connection.cpp
     integration/test_statements.cpp
     integration/test_execution.cpp
@@ -31,7 +32,7 @@ add_executable(pgpp_integration_tests
     integration/test_raw.cpp
 )
 
-target_link_libraries(pgpp_integration_tests PRIVATE pgpp GTest::gtest_main)
+target_link_libraries(pgpp_integration_tests PRIVATE pgpp GTest::gtest)
 target_compile_definitions(pgpp_integration_tests PRIVATE PGPP_TESTING)
 set_property(TARGET pgpp_integration_tests PROPERTY CXX_STANDARD 20)
 

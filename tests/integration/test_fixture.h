@@ -1,29 +1,15 @@
 #pragma once
 
+#include "../common/test_config.h"
 #include <pgpp/pgpp.h>
 #include <gtest/gtest.h>
-#include <cstdlib>
 #include <string>
 
 // Shared fixture for integration tests.
 // Reads connection info from environment variables or uses defaults.
 // Creates a test table in SetUp, drops it in TearDown.
 
-inline PgppConnectionInfo getTestConnectionInfo()
-{
-    PgppConnectionInfo info;
-    auto env = [](const char* name, const char* fallback) -> std::string {
-        const char* val = std::getenv(name);
-        return val ? val : fallback;
-    };
-    info.dbname   = env("PGPP_TEST_DBNAME",   "draft");
-    info.host     = env("PGPP_TEST_HOST",      "127.0.0.1");
-    info.user     = env("PGPP_TEST_USER",      "postgres");
-    info.password = env("PGPP_TEST_PASSWORD",  "123");
-    info.port     = static_cast<uint16_t>(std::stoi(env("PGPP_TEST_PORT", "5432")));
-    info.sslmode  = "prefer";
-    return info;
-}
+using pgpp_test::getTestConnectionInfo;
 
 class PgppIntegrationTest : public ::testing::Test {
 protected:

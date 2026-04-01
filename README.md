@@ -89,6 +89,10 @@ NULL values are left at their C++ default (empty string, 0, false).
 - PostgreSQL (libpq)
 - CMake 3.16+
 
+## Development
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, testing setup, and project structure.
+
 ## License
 
 GPL v3 — see [LICENSE](LICENSE).
