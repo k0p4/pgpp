@@ -1,6 +1,6 @@
 // IT-CORO-001 through IT-CORO-003: Coroutine tests
 
-#include "test_fixture.h"
+#include "integration_fixture.h"
 #include <pgpp/pgpp_coroutines.h>
 #include <atomic>
 #include <chrono>

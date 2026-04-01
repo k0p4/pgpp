@@ -1,6 +1,6 @@
 // IT-EXEC-001 through IT-EXEC-009: Direct execution tests
 
-#include "test_fixture.h"
+#include "integration_fixture.h"
 
 // ── IT-EXEC-001: execRaw CREATE/DROP ────────────────────────────────────────
 

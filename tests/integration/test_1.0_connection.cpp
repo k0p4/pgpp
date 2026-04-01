@@ -1,6 +1,6 @@
 // IT-CONN-001 through IT-CONN-006: Connection lifecycle tests
 
-#include "test_fixture.h"
+#include "integration_fixture.h"
 
 // ── IT-CONN-001: open with valid string ─────────────────────────────────────
 

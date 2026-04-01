@@ -1,6 +1,6 @@
 // IT-RAW-001, IT-RAW-002: Raw SQL execution via pool
 
-#include "test_fixture.h"
+#include "integration_fixture.h"
 
 // ── IT-RAW-001: execRawSync DDL ─────────────────────────────────────────────
 

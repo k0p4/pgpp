@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../common/test_config.h"
+#include "test_config.h"
 #include <pgpp/pgpp.h>
 #include <gtest/gtest.h>
 #include <string>
