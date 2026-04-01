@@ -3,6 +3,7 @@
 
 #include <pgpp/pgpp_connection.h>
 #include <gtest/gtest.h>
+#include <cmath>
 
 using namespace Internal::Details;
 

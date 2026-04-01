@@ -88,10 +88,18 @@ jobs:
       - name: "Unit tests"
         run: ctest --test-dir build -C ${{matrix.build_type}} --output-on-failure -R pgpp_unit_tests
 
-      - name: "Setup Docker"
-        uses: docker/setup-docker-action@v5
+      - name: "Setup PostgreSQL"
+        uses: ikalnytskyi/action-setup-postgres@v8
+        with:
+          postgres-version: "16"
+          username: postgres
+          password: pgpp_test_pass
+          database: pgpp_test
+          port: 15432
 
       - name: "Integration tests"
+        env:
+          PGPP_SKIP_DOCKER: "1"
         run: ctest --test-dir build -C ${{matrix.build_type}} --output-on-failure -R pgpp_integration_tests
 
 
