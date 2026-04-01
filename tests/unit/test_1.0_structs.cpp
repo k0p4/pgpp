@@ -58,3 +58,4 @@ TEST(OIDConstants, MatchPostgreSQLCatalog)
     EXPECT_EQ(pg::TIMESTAMPTZ, 1184u);
     EXPECT_EQ(pg::TIMETZ,     1266u);
 }
+

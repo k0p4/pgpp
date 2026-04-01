@@ -105,3 +105,112 @@ TEST_F(PgppPoolTest, BuildConnectionStringPortZeroOmitted)
     std::string result = build(info);
     EXPECT_EQ(result.find("port="), std::string::npos);
 }
+
+// ── Options field ───────────────────────────────────────────────────────────
+
+TEST_F(PgppPoolTest, BuildConnectionStringOptionsIncluded)
+{
+    PgppConnectionInfo info;
+    info.dbname  = "testdb";
+    info.host    = "localhost";
+    info.options = "-c search_path=myschema";
+
+    std::string result = build(info);
+    EXPECT_NE(result.find("options="), std::string::npos);
+}
+
+TEST_F(PgppPoolTest, BuildConnectionStringSslmodeIncluded)
+{
+    PgppConnectionInfo info;
+    info.dbname  = "testdb";
+    info.host    = "localhost";
+    info.sslmode = "require";
+
+    std::string result = build(info);
+    EXPECT_NE(result.find("sslmode="), std::string::npos);
+    EXPECT_NE(result.find("require"), std::string::npos);
+}
+
+// ── Special characters ──────────────────────────────────────────────────────
+
+TEST_F(PgppPoolTest, BuildConnectionStringMixedSpecialChars)
+{
+    PgppConnectionInfo info;
+    info.dbname   = "testdb";
+    info.host     = "localhost";
+    info.user     = "admin";
+    info.password = "p'a\\ss'w\\ord";
+
+    std::string result = build(info);
+    // All single quotes and backslashes must be escaped
+    EXPECT_NE(result.find("password="), std::string::npos);
+    // Original ' and \ should not appear unescaped
+    EXPECT_EQ(result.find("password='p'a"), std::string::npos)
+        << "Unescaped quote found in: " << result;
+}
+
+TEST_F(PgppPoolTest, BuildConnectionStringUsernameWithSpaces)
+{
+    PgppConnectionInfo info;
+    info.dbname = "testdb";
+    info.host   = "localhost";
+    info.user   = "my user";
+
+    std::string result = build(info);
+    EXPECT_NE(result.find("user='my user'"), std::string::npos)
+        << "Username with spaces should be quoted: " << result;
+}
+
+// ── Port boundaries ─────────────────────────────────────────────────────────
+
+TEST_F(PgppPoolTest, BuildConnectionStringPortMax)
+{
+    PgppConnectionInfo info;
+    info.dbname = "testdb";
+    info.host   = "localhost";
+    info.port   = 65535;
+
+    std::string result = build(info);
+    EXPECT_NE(result.find("port=65535"), std::string::npos);
+}
+
+TEST_F(PgppPoolTest, BuildConnectionStringPortMin)
+{
+    PgppConnectionInfo info;
+    info.dbname = "testdb";
+    info.host   = "localhost";
+    info.port   = 1;
+
+    std::string result = build(info);
+    EXPECT_NE(result.find("port=1 "), std::string::npos);
+}
+
+// ── Minimal fields ──────────────────────────────────────────────────────────
+
+TEST_F(PgppPoolTest, BuildConnectionStringMinimalFields)
+{
+    PgppConnectionInfo info;
+    info.dbname = "testdb";
+    info.host   = "localhost";
+    // all optional fields left empty, port at default
+
+    std::string result = build(info);
+    EXPECT_FALSE(result.empty());
+    EXPECT_NE(result.find("dbname="), std::string::npos);
+    EXPECT_NE(result.find("host="), std::string::npos);
+    EXPECT_EQ(result.find("user="), std::string::npos);
+    EXPECT_EQ(result.find("password="), std::string::npos);
+    EXPECT_EQ(result.find("sslmode="), std::string::npos);
+    EXPECT_EQ(result.find("options="), std::string::npos);
+}
+
+TEST_F(PgppPoolTest, BuildConnectionStringUnicodeDbname)
+{
+    PgppConnectionInfo info;
+    info.dbname = "\xd1\x82\xd0\xb5\xd1\x81\xd1\x82"; // тест (Cyrillic)
+    info.host   = "localhost";
+
+    std::string result = build(info);
+    EXPECT_FALSE(result.empty());
+    EXPECT_NE(result.find("dbname="), std::string::npos);
+}

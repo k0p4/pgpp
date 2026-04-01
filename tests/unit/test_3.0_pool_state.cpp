@@ -134,3 +134,58 @@ TEST(PoolState, AsyncOnUninitializedPoolReturnsNullopt)
     auto result3 = future3.get();
     EXPECT_FALSE(result3.has_value());
 }
+
+// ── prepareStatement on uninitialized pool ──────────────────────────────────
+
+TEST(PoolState, PrepareStatementBeforeInitialize)
+{
+    PgppPool pool;
+    Statement stmt;
+    stmt.statementName = "test_stmt";
+    stmt.statement = "SELECT $1";
+    stmt.variables = { pg::VARCHAR };
+
+    // Should store the statement without crashing (no connections to prepare on)
+    EXPECT_NO_THROW(pool.prepareStatement(stmt));
+}
+
+TEST(PoolState, PrepareStatementEmptyName)
+{
+    PgppPool pool;
+    Statement stmt;
+    stmt.statementName = "";
+    stmt.statement = "SELECT 1";
+
+    EXPECT_NO_THROW(pool.prepareStatement(stmt));
+}
+
+// ── Callback-based operations on uninitialized pool ─────────────────────────
+
+TEST(PoolState, CallbackExecOnUninitializedPool)
+{
+    PgppPool pool;
+    bool callbackCalled {};
+    pool.exec("nonexistent",
+        [&callbackCalled](std::optional<bool> result) {
+            callbackCalled = true;
+            EXPECT_FALSE(result.has_value());
+        },
+        std::string("arg"));
+
+    // Give a moment for the callback (though it should be immediate for rejected requests)
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // Callback may or may not be called depending on implementation —
+    // the important thing is no crash
+    SUCCEED();
+}
+
+TEST(PoolState, TransactionOnUninitializedPool)
+{
+    PgppPool pool;
+    auto future = pool.transaction([](PgppConnection&) {
+        // Should never execute
+    });
+
+    auto result = future.get();
+    EXPECT_FALSE(result.has_value());
+}
