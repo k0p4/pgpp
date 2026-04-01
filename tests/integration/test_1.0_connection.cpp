@@ -1,6 +1,7 @@
 // IT-CONN-001 through IT-CONN-006: Connection lifecycle tests
 
 #include "integration_fixture.h"
+#include <chrono>
 
 // ── IT-CONN-001: open with valid string ─────────────────────────────────────
 
@@ -100,4 +101,59 @@ TEST(ConnectionLifecycle, LastErrorAfterFailure)
     EXPECT_FALSE(conn.lastError().empty());
 
     conn.close();
+}
+
+// ── Reconnect after close ──────────────────────────────────────────────────
+
+TEST(ConnectionLifecycle, ReconnectAfterClose)
+{
+    auto info = getTestConnectionInfo();
+    std::string cs = "dbname='" + info.dbname + "' host='" + info.host + "' "
+                   + "port=" + std::to_string(info.port) + " "
+                   + "user='" + info.user + "' password='" + info.password + "'";
+
+    PgppConnection conn;
+    ASSERT_TRUE(conn.open(cs));
+    conn.close();
+    EXPECT_FALSE(conn.isOpen());
+
+    // Re-open on the same object
+    EXPECT_TRUE(conn.open(cs));
+    EXPECT_TRUE(conn.isOpen());
+    EXPECT_TRUE(conn.execRaw("SELECT 1"));
+    conn.close();
+}
+
+// ── Open twice without close ───────────────────────────────────────────────
+
+TEST(ConnectionLifecycle, OpenTwiceWithoutClose)
+{
+    auto info = getTestConnectionInfo();
+    std::string cs = "dbname='" + info.dbname + "' host='" + info.host + "' "
+                   + "port=" + std::to_string(info.port) + " "
+                   + "user='" + info.user + "' password='" + info.password + "'";
+
+    PgppConnection conn;
+    ASSERT_TRUE(conn.open(cs));
+
+    // Second open without close — document behavior
+    bool secondOpen = conn.open(cs);
+    // Either succeeds (replaces) or fails (already open) — neither should crash
+    EXPECT_TRUE(conn.isOpen());
+    (void)secondOpen;
+    conn.close();
+}
+
+// ── Invalid host fast fail ─────────────────────────────────────────────────
+
+TEST(ConnectionLifecycle, InvalidHostFastFail)
+{
+    PgppConnection conn;
+    auto start = std::chrono::steady_clock::now();
+    EXPECT_FALSE(conn.open("dbname='test' host='127.0.0.1' port=1"));
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    // Should fail within a reasonable time, not hang
+    EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(), 10);
+    EXPECT_FALSE(conn.isOpen());
 }

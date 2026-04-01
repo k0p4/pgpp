@@ -4,6 +4,8 @@
 #include <thread>
 #include <atomic>
 #include <vector>
+#include <future>
+#include <chrono>
 
 // ── IT-POOL-001: initialize with 2 connections ──────────────────────────────
 
@@ -261,4 +263,103 @@ TEST_F(PgppIntegrationTest, PoolExecZeroArgs)
     auto [ok, rows] = pool.querySync<Row>("zero_sel");
     EXPECT_TRUE(ok);
     EXPECT_GE(rows.size(), 1u);
+}
+
+// ── Single connection pool ─────────────────────────────────────────────────
+
+TEST(PoolSingleConnection, SequentialQueries)
+{
+    auto info = getTestConnectionInfo();
+    PgppPool pool;
+    ASSERT_TRUE(pool.initialize(info, 1));
+
+    // Create table (raw TEST — no fixture creates it)
+    pool.execRawSync("DROP TABLE IF EXISTS pgpp_test_table");
+    ASSERT_TRUE(pool.execRawSync(
+        "CREATE TABLE pgpp_test_table ("
+        "  id SERIAL PRIMARY KEY,"
+        "  name VARCHAR(255),"
+        "  score INTEGER DEFAULT 0,"
+        "  rating DOUBLE PRECISION DEFAULT 0.0,"
+        "  active BOOLEAN DEFAULT true"
+        ")"));
+
+    pool.prepareStatement({"single_ins", "INSERT INTO pgpp_test_table (name, score) VALUES ($1, $2)", {pg::VARCHAR, pg::INT4}});
+
+    for (int i = 0; i < 5; ++i) {
+        EXPECT_TRUE(pool.execSync("single_ins",
+            std::string("single_" + std::to_string(i)), std::to_string(i)));
+    }
+
+    pool.prepareStatement({"single_count", "SELECT COUNT(*) FROM pgpp_test_table", {}});
+    auto [ok, rows] = pool.querySync<std::tuple<int>>("single_count");
+    EXPECT_TRUE(ok);
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_GE(std::get<0>(rows[0]), 5);
+
+    pool.execRawSync("DROP TABLE IF EXISTS pgpp_test_table");
+    pool.shutdown();
+}
+
+// ── Queue saturation: more requests than connections ───────────────────────
+
+TEST_F(PgppIntegrationTest, QueueSaturation)
+{
+    pool.prepareStatement({"sat_ins", "INSERT INTO pgpp_test_table (name) VALUES ($1)", {pg::VARCHAR}});
+
+    // Fire 20 async requests on a 2-connection pool
+    std::vector<std::future<std::optional<bool>>> futures;
+    for (int i = 0; i < 20; ++i)
+        futures.push_back(pool.execAsync("sat_ins", std::string("sat_" + std::to_string(i))));
+
+    // All should complete eventually
+    for (auto& f : futures) {
+        auto result = f.get();
+        ASSERT_TRUE(result.has_value());
+        EXPECT_TRUE(result.value());
+    }
+}
+
+// ── Worker recovery after bad query ────────────────────────────────────────
+
+TEST_F(PgppIntegrationTest, WorkerRecoveryAfterBadQuery)
+{
+    // Execute invalid SQL — should fail
+    EXPECT_FALSE(pool.execRawSync("INVALID SQL THAT WILL FAIL"));
+
+    // Pool should still work after the failure
+    EXPECT_TRUE(pool.execRawSync("SELECT 1"));
+    EXPECT_TRUE(pool.execRawSync("INSERT INTO pgpp_test_table (name) VALUES ('recovery')"));
+}
+
+// ── Shutdown during active query ───────────────────────────────────────────
+
+TEST(PoolShutdownActive, ShutdownDuringSlowQuery)
+{
+    auto info = getTestConnectionInfo();
+    PgppPool pool;
+    ASSERT_TRUE(pool.initialize(info, 1));
+
+    // Fire a slow query
+    auto future = pool.execRawAsync("SELECT pg_sleep(2)");
+
+    // Shutdown immediately — should not hang
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    pool.shutdown();
+
+    // Future must resolve within reasonable time
+    auto status = future.wait_for(std::chrono::seconds(5));
+    EXPECT_NE(status, std::future_status::timeout) << "Future hung after shutdown";
+}
+
+// ── Query returning zero rows via pool ─────────────────────────────────────
+
+TEST_F(PgppIntegrationTest, PoolQueryReturningZeroRows)
+{
+    pool.prepareStatement({"zero_rows", "SELECT name FROM pgpp_test_table WHERE name = $1", {pg::VARCHAR}});
+
+    using Row = std::tuple<std::string>;
+    auto [ok, rows] = pool.querySync<Row>("zero_rows", std::string("nonexistent_xyz_999"));
+    EXPECT_TRUE(ok);
+    EXPECT_TRUE(rows.empty());
 }

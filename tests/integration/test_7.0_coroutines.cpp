@@ -117,3 +117,56 @@ TEST_F(PgppIntegrationTest, CoExecPreparedBackwardCompat)
     ASSERT_EQ(queryRows.size(), 1u);
     EXPECT_EQ(std::get<0>(queryRows[0]), "compat_user");
 }
+
+// ── coExec with failing query ──────────────────────────────────────────────
+
+TEST_F(PgppIntegrationTest, CoExecFailingQuery)
+{
+    // Don't prepare "nonexistent_coro_stmt" — it will fail
+    std::atomic<bool> done { false };
+    std::optional<bool> result;
+
+    auto coro = [&]() -> FireAndForget {
+        result = co_await coExec(pool, "nonexistent_coro_stmt", std::string("arg"));
+        done.store(true);
+    };
+    coro();
+
+    for (int i = 0; i < 50 && !done.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    ASSERT_TRUE(done.load()) << "Coroutine with failing query should still complete";
+    // Result should indicate failure (false) or no value
+    if (result.has_value())
+        EXPECT_FALSE(result.value());
+}
+
+// ── co_await on shutdown pool ──────────────────────────────────────────────
+
+TEST(CoroutineShutdown, CoAwaitOnShutdownPool)
+{
+    auto info = getTestConnectionInfo();
+    PgppPool pool;
+    ASSERT_TRUE(pool.initialize(info, 1));
+
+    pool.prepareStatement({"coro_shutdown", "SELECT 1", {}});
+
+    // Shutdown first
+    pool.shutdown();
+
+    std::atomic<bool> done { false };
+    std::optional<bool> result;
+
+    auto coro = [&]() -> FireAndForget {
+        result = co_await coExec(pool, "coro_shutdown");
+        done.store(true);
+    };
+    coro();
+
+    for (int i = 0; i < 50 && !done.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    ASSERT_TRUE(done.load()) << "Coroutine on shutdown pool should not hang";
+    // Should return nullopt or false
+    EXPECT_TRUE(!result.has_value() || !result.value());
+}

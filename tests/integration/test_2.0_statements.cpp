@@ -45,3 +45,24 @@ TEST_F(PgppConnectionTest, IsPreparedFalseForUnknown)
 {
     EXPECT_FALSE(conn.isPrepared("never_prepared_xyz_999"));
 }
+
+// ── Re-prepare after connection reset ──────────────────────────────────────
+
+TEST_F(PgppConnectionTest, RePrepareAfterReset)
+{
+    Statement stmt;
+    stmt.statementName = "reset_test";
+    stmt.statement = "SELECT name FROM pgpp_test_table WHERE id = $1";
+    stmt.variables = { pg::INT4 };
+    ASSERT_TRUE(conn.prepare(stmt));
+    EXPECT_TRUE(conn.isPrepared("reset_test"));
+
+    // Reset clears server-side prepared statements
+    conn.reset();
+    EXPECT_TRUE(conn.isOpen());
+
+    // Re-prepare should succeed
+    EXPECT_TRUE(conn.prepare(stmt));
+    EXPECT_TRUE(conn.isPrepared("reset_test"));
+}
+

@@ -156,3 +156,95 @@ TEST_F(PgppConnectionTest, ExecPreparedWrongParamCount)
     // Pass no arguments when 1 is expected — should fail, not crash
     EXPECT_FALSE(conn.execPrepared("one_param"));
 }
+
+// ── All-NULL row: nullable columns default to zero values ──────────────────
+
+TEST_F(PgppConnectionTest, ExecPreparedAllNullRow)
+{
+    // Explicitly insert NULLs for all nullable columns (overriding DEFAULTs)
+    conn.execRaw("INSERT INTO pgpp_test_table (name, score, rating, active) VALUES (NULL, NULL, NULL, NULL)");
+
+    Statement stmt;
+    stmt.statementName = "sel_nulls";
+    stmt.statement = "SELECT name, score, rating, active FROM pgpp_test_table WHERE name IS NULL";
+    stmt.variables = {};
+    ASSERT_TRUE(conn.prepare(stmt));
+
+    std::vector<std::tuple<std::string, int, double, bool>> rows;
+    EXPECT_TRUE(conn.execPrepared("sel_nulls", rows));
+    ASSERT_EQ(rows.size(), 1u);
+    // fillPQValue skips assignment on NULL → tuple members keep C++ default-initialized values
+    EXPECT_EQ(std::get<0>(rows[0]), "");        // string default
+    EXPECT_EQ(std::get<1>(rows[0]), 0);         // int default
+    EXPECT_DOUBLE_EQ(std::get<2>(rows[0]), 0.0); // double default
+    EXPECT_FALSE(std::get<3>(rows[0]));          // bool default (false)
+}
+
+// ── Integer boundary values ────────────────────────────────────────────────
+
+TEST_F(PgppConnectionTest, ExecPreparedIntBoundaryValues)
+{
+    Statement ins;
+    ins.statementName = "ins_boundary";
+    ins.statement = "INSERT INTO pgpp_test_table (name, score) VALUES ($1, $2)";
+    ins.variables = { pg::VARCHAR, pg::INT4 };
+    ASSERT_TRUE(conn.prepare(ins));
+
+    EXPECT_TRUE(conn.execPrepared("ins_boundary", std::string("max"), std::to_string(INT_MAX)));
+    EXPECT_TRUE(conn.execPrepared("ins_boundary", std::string("min"), std::to_string(INT_MIN)));
+
+    Statement sel;
+    sel.statementName = "sel_boundary";
+    sel.statement = "SELECT score FROM pgpp_test_table WHERE name = $1";
+    sel.variables = { pg::VARCHAR };
+    ASSERT_TRUE(conn.prepare(sel));
+
+    std::vector<std::tuple<int>> rows;
+    EXPECT_TRUE(conn.execPrepared("sel_boundary", rows, std::string("max")));
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(std::get<0>(rows[0]), INT_MAX);
+
+    rows.clear();
+    EXPECT_TRUE(conn.execPrepared("sel_boundary", rows, std::string("min")));
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(std::get<0>(rows[0]), INT_MIN);
+}
+
+// ── Float precision round-trip ─────────────────────────────────────────────
+
+TEST_F(PgppConnectionTest, ExecPreparedFloatPrecision)
+{
+    Statement ins;
+    ins.statementName = "ins_float";
+    ins.statement = "INSERT INTO pgpp_test_table (name, rating) VALUES ($1, $2)";
+    ins.variables = { pg::VARCHAR, pg::FLOAT8 };
+    ASSERT_TRUE(conn.prepare(ins));
+
+    EXPECT_TRUE(conn.execPrepared("ins_float", std::string("pi"), std::string("3.141592653589793")));
+
+    Statement sel;
+    sel.statementName = "sel_float";
+    sel.statement = "SELECT rating FROM pgpp_test_table WHERE name = $1";
+    sel.variables = { pg::VARCHAR };
+    ASSERT_TRUE(conn.prepare(sel));
+
+    std::vector<std::tuple<double>> rows;
+    EXPECT_TRUE(conn.execPrepared("sel_float", rows, std::string("pi")));
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_NEAR(std::get<0>(rows[0]), 3.141592653589793, 1e-10);
+}
+
+// ── SELECT returning zero rows ─────────────────────────────────────────────
+
+TEST_F(PgppConnectionTest, ExecPreparedZeroRows)
+{
+    Statement stmt;
+    stmt.statementName = "sel_empty";
+    stmt.statement = "SELECT name FROM pgpp_test_table WHERE name = $1";
+    stmt.variables = { pg::VARCHAR };
+    ASSERT_TRUE(conn.prepare(stmt));
+
+    std::vector<std::tuple<std::string>> rows;
+    EXPECT_TRUE(conn.execPrepared("sel_empty", rows, std::string("nonexistent_xyz")));
+    EXPECT_TRUE(rows.empty());
+}
