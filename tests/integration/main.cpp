@@ -1,4 +1,4 @@
-#include "../common/docker_fixture.h"
+#include "docker_fixture.h"
 #include <gtest/gtest.h>
 
 int main(int argc, char** argv)

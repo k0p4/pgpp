@@ -1,6 +1,6 @@
 // IT-STMT-001 through IT-STMT-004: Prepared statement tests
 
-#include "test_fixture.h"
+#include "integration_fixture.h"
 
 // ── IT-STMT-001: prepare with valid SQL ─────────────────────────────────────
 

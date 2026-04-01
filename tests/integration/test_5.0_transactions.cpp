@@ -1,6 +1,6 @@
 // IT-TXN-001 through IT-TXN-003: Transaction tests
 
-#include "test_fixture.h"
+#include "integration_fixture.h"
 
 // ── IT-TXN-001: Transaction commits on success ──────────────────────────────
 

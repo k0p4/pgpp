@@ -48,13 +48,13 @@ pgpp/
     pgpp_log.h            # Compile-time logging (alog / stderr / no-op)
   tests/
     common/
-      test_config.h       # Test configuration constants, getTestConnectionInfo()
-      docker_fixture.h    # DockerPostgresEnvironment (auto-manage PostgreSQL container)
-    unit/                 # Unit tests (no database needed)
+      test_config.h           # Test configuration constants, getTestConnectionInfo()
+      docker_fixture.h        # DockerPostgresEnvironment (auto-manage PostgreSQL container)
+      integration_fixture.h   # PgppIntegrationTest, PgppConnectionTest fixtures
+    unit/                     # Unit tests (no database needed), numeric-prefixed
     integration/
-      main.cpp            # Custom main with Docker environment registration
-      test_fixture.h      # Integration test fixtures
-      test_*.cpp           # Integration test files
+      main.cpp                # Custom main with Docker environment registration
+      test_*.cpp              # Integration test files, numeric-prefixed
   docs/
     SPECIFICATION.md      # Full API specification with requirements (REQ-PGPP-NNN)
     TESTING_ROADMAP.md    # Test plan: unit tests and integration tests
@@ -123,3 +123,7 @@ Single connection wrapper. Used internally by pool workers. Direct use is for te
 
 Designed for integration via CMake FetchContent. Downstream projects link against the
 `pgpp` target, which transitively provides `PostgreSQL::PostgreSQL` includes and libraries.
+
+## Contributing & Building
+
+See @CONTRIBUTING.md for prerequisites, build instructions, and testing guide.

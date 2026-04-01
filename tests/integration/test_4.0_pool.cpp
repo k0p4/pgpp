@@ -1,6 +1,6 @@
 // IT-POOL-001 through IT-POOL-010: Pool operations tests
 
-#include "test_fixture.h"
+#include "integration_fixture.h"
 #include <thread>
 #include <atomic>
 #include <vector>
