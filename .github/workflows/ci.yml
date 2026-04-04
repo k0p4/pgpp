@@ -8,6 +8,9 @@ on:
 
 jobs:
   Build-Linux:
+    permissions:
+      checks: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -37,13 +40,28 @@ jobs:
           cmake --build build --config ${{matrix.build_type}} -j $(nproc)
 
       - name: "Unit tests"
+        env:
+          GTEST_OUTPUT: xml:${{github.workspace}}/test-results/unit-tests.xml
         run: ctest --test-dir build -C ${{matrix.build_type}} --output-on-failure -R pgpp_unit_tests
 
       - name: "Integration tests"
+        env:
+          GTEST_OUTPUT: xml:${{github.workspace}}/test-results/integration-tests.xml
         run: ctest --test-dir build -C ${{matrix.build_type}} --output-on-failure -R pgpp_integration_tests
+
+      - name: "Test report"
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: "Tests / Linux ${{matrix.compiler}} ${{matrix.build_type}}"
+          path: test-results/*.xml
+          reporter: java-junit
 
 
   Build-Windows:
+    permissions:
+      checks: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -62,10 +80,23 @@ jobs:
           cmake --build build --config ${{matrix.build_type}} -j $NUMBER_OF_PROCESSORS
 
       - name: "Unit tests"
+        env:
+          GTEST_OUTPUT: xml:${{github.workspace}}/test-results/unit-tests.xml
         run: ctest --test-dir build -C ${{matrix.build_type}} --output-on-failure -R pgpp_unit_tests
+
+      - name: "Test report"
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: "Tests / Windows ${{matrix.build_type}}"
+          path: test-results/*.xml
+          reporter: java-junit
 
 
   Build-MacOS:
+    permissions:
+      checks: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -86,6 +117,8 @@ jobs:
           cmake --build build --config ${{matrix.build_type}} -j $(sysctl -n hw.ncpu)
 
       - name: "Unit tests"
+        env:
+          GTEST_OUTPUT: xml:${{github.workspace}}/test-results/unit-tests.xml
         run: ctest --test-dir build -C ${{matrix.build_type}} --output-on-failure -R pgpp_unit_tests
 
       - name: "Setup PostgreSQL"
@@ -100,7 +133,16 @@ jobs:
       - name: "Integration tests"
         env:
           PGPP_SKIP_DOCKER: "1"
+          GTEST_OUTPUT: xml:${{github.workspace}}/test-results/integration-tests.xml
         run: ctest --test-dir build -C ${{matrix.build_type}} --output-on-failure -R pgpp_integration_tests
+
+      - name: "Test report"
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: "Tests / macOS ${{matrix.build_type}}"
+          path: test-results/*.xml
+          reporter: java-junit
 
 
   CodeChecker:
