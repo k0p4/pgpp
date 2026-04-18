@@ -245,7 +245,7 @@ void PgppPool::shutdown()
     PGPP_LOGD << "Pool shut down";
 }
 
-bool PgppPool::isInitialized() const { return m_initialized.load(); }
+bool PgppPool::isInitialized() const noexcept { return m_initialized.load(); }
 
 void PgppPool::prepareStatement(const Statement& statement)
 {
@@ -287,16 +287,16 @@ std::future<std::optional<bool>> PgppPool::execRawAsync(const std::string& sql)
     return future;
 }
 
-size_t PgppPool::totalConnections() const { return m_connections.size(); }
+size_t PgppPool::totalConnections() const noexcept { return m_connections.size(); }
 
-size_t PgppPool::freeConnections() const
+size_t PgppPool::freeConnections() const noexcept
 {
     const size_t busy = m_busyWorkers.load(std::memory_order_relaxed);
     const size_t total = m_connections.size();
     return (busy <= total) ? (total - busy) : 0;
 }
 
-size_t PgppPool::busyConnections() const { return m_busyWorkers.load(std::memory_order_relaxed); }
+size_t PgppPool::busyConnections() const noexcept { return m_busyWorkers.load(std::memory_order_relaxed); }
 
 size_t PgppPool::queuedRequests() const
 {

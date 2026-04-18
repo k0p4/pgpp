@@ -51,37 +51,68 @@ struct FireAndForget
     };
 };
 
+// Shared state for coroutine awaitables.
+//
+// Lifetime contract: the awaitable lives on the caller's coroutine frame.
+// Its `await_suspend` hands a PgppRequest to the pool, whose `task` lambda
+// may run on a worker thread at an arbitrary later point (including during
+// `shutdown()`, when `conn` is nullptr).
+//
+// Capturing `this` in that lambda would dangle the moment the coroutine
+// frame is destroyed — which for FireAndForget is tied to coroutine
+// completion and therefore safe in practice, but *not* guaranteed for
+// caller-defined coroutine return types that expose `handle.destroy()`.
+// To make the awaitable safe regardless of caller, all mutable state lives
+// in a heap-allocated struct owned by a shared_ptr: the awaitable holds one
+// ref (to be read by `await_resume`), and the worker's lambda captures a
+// copy by value. Destroying either side is harmless — the worker writes to
+// valid memory, and on resume the awaitable reads the value the worker
+// already wrote.
+//
+// Note: `handle.resume()` on a destroyed coroutine handle is still UB. The
+// library does not protect against that — callers must keep the awaiting
+// coroutine alive until the awaitable yields. FireAndForget satisfies this
+// by construction (its handle isn't exposed, and it self-destructs only
+// after the final return).
+
 // co_await coExec(db, "stmt", args...) -> std::optional<bool>
 template<typename... Ts>
 class DbExecAwaitable
 {
 public:
     DbExecAwaitable(PgppPool& db, std::string statement, Ts... args)
-        : m_db(db), m_statement(std::move(statement)), m_args(std::move(args)...) {}
+        : m_state(std::make_shared<State>(db, std::move(statement), std::move(args)...))
+    {}
 
     bool await_ready() const noexcept { return false; }
 
     bool await_suspend(std::coroutine_handle<> handle)
     {
+        auto state = m_state;                // captured by value — keeps state alive
         auto request = std::make_unique<PgppRequest>();
-        request->task = [this, handle](PgppConnection* conn) mutable {
+        request->task = [state, handle](PgppConnection* conn) mutable {
             if (conn) {
-                m_result = std::apply(
-                    [&](const auto&... a) -> bool { return conn->execPrepared(m_statement, a...); },
-                    m_args);
+                state->result = std::apply(
+                    [&](const auto&... a) -> bool { return conn->execPrepared(state->statement, a...); },
+                    state->args);
             }
             handle.resume();
         };
-        return m_db.enqueueRaw(std::move(request));
+        return state->db.enqueueRaw(std::move(request));
     }
 
-    std::optional<bool> await_resume() noexcept { return m_result; }
+    std::optional<bool> await_resume() noexcept { return m_state->result; }
 
 private:
-    PgppPool&           m_db;
-    std::string         m_statement;
-    std::tuple<Ts...>   m_args;
-    std::optional<bool> m_result;
+    struct State {
+        State(PgppPool& d, std::string s, Ts... a)
+            : db(d), statement(std::move(s)), args(std::move(a)...) {}
+        PgppPool&           db;
+        std::string         statement;
+        std::tuple<Ts...>   args;
+        std::optional<bool> result;
+    };
+    std::shared_ptr<State> m_state;
 };
 
 // co_await coQuery<RowTuple>(db, "stmt", args...)
@@ -93,36 +124,43 @@ public:
     using Rows = std::vector<RowTuple>;
 
     DbResultAwaitable(PgppPool& db, std::string statement, Ts... args)
-        : m_db(db), m_statement(std::move(statement)), m_args(std::move(args)...) {}
+        : m_state(std::make_shared<State>(db, std::move(statement), std::move(args)...))
+    {}
 
     bool await_ready() const noexcept { return false; }
 
     bool await_suspend(std::coroutine_handle<> handle)
     {
+        auto state = m_state;                // captured by value — keeps state alive
         auto request = std::make_unique<PgppRequest>();
-        request->task = [this, handle](PgppConnection* conn) mutable {
+        request->task = [state, handle](PgppConnection* conn) mutable {
             if (conn) {
-                m_result = std::apply(
+                state->result = std::apply(
                     [&](const auto&... a) -> bool {
-                        return conn->execPrepared(m_statement, m_rows, a...);
-                    }, m_args);
+                        return conn->execPrepared(state->statement, state->rows, a...);
+                    }, state->args);
             }
             handle.resume();
         };
-        return m_db.enqueueRaw(std::move(request));
+        return state->db.enqueueRaw(std::move(request));
     }
 
     std::pair<std::optional<bool>, Rows> await_resume() noexcept
     {
-        return { m_result, std::move(m_rows) };
+        return { m_state->result, std::move(m_state->rows) };
     }
 
 private:
-    PgppPool&           m_db;
-    std::string         m_statement;
-    std::tuple<Ts...>   m_args;
-    std::optional<bool> m_result;
-    Rows                m_rows;
+    struct State {
+        State(PgppPool& d, std::string s, Ts... a)
+            : db(d), statement(std::move(s)), args(std::move(a)...) {}
+        PgppPool&           db;
+        std::string         statement;
+        std::tuple<Ts...>   args;
+        std::optional<bool> result;
+        Rows                rows;
+    };
+    std::shared_ptr<State> m_state;
 };
 
 // Factory helpers

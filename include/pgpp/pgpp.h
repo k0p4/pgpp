@@ -56,7 +56,7 @@ public:
 
     bool initialize(const PgppConnectionInfo& dbInfo, size_t poolSize = 0);
     void shutdown();
-    bool isInitialized() const;
+    bool isInitialized() const noexcept;
     void prepareStatement(const Statement& statement);
 
     // Synchronous (blocking)
@@ -96,10 +96,10 @@ public:
     // Public for coroutine awaitables (see pgpp_coroutines.h)
     bool enqueueRaw(std::unique_ptr<PgppRequest> request);
 
-    size_t totalConnections() const;
-    size_t freeConnections()  const;
-    size_t busyConnections()  const;
-    size_t queuedRequests()   const;
+    size_t totalConnections() const noexcept;
+    size_t freeConnections()  const noexcept;
+    size_t busyConnections()  const noexcept;
+    size_t queuedRequests()   const;                 // takes m_queueMutex — not noexcept
 
 private:
     size_t      m_poolSize { std::thread::hardware_concurrency() };
