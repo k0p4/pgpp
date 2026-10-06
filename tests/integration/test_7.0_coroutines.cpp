@@ -6,6 +6,19 @@
 #include <chrono>
 #include <thread>
 
+namespace {
+
+// Polls `ready` every 10 ms for up to 5 s.
+template<typename Ready>
+bool waitFor(Ready ready)
+{
+    for (int i = 0; i < 500 && !ready(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    return ready();
+}
+
+} // namespace
+
 // ── IT-CORO-001: coExec executes INSERT ─────────────────────────────────────
 
 TEST_F(PgppIntegrationTest, CoExecInsert)
@@ -21,11 +34,7 @@ TEST_F(PgppIntegrationTest, CoExecInsert)
     };
     coro();
 
-    // Wait for coroutine to complete
-    for (int i = 0; i < 50 && !done.load(); ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-    ASSERT_TRUE(done.load());
+    ASSERT_TRUE(waitFor([&] { return done.load(); }));
     ASSERT_TRUE(result.has_value());
     EXPECT_TRUE(result.value());
 }
@@ -50,10 +59,7 @@ TEST_F(PgppIntegrationTest, CoQueryReturnsRows)
     };
     coro();
 
-    for (int i = 0; i < 50 && !done.load(); ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-    ASSERT_TRUE(done.load());
+    ASSERT_TRUE(waitFor([&] { return done.load(); }));
     ASSERT_TRUE(queryOk.has_value());
     EXPECT_TRUE(queryOk.value());
     ASSERT_EQ(queryRows.size(), 1u);
@@ -84,10 +90,7 @@ TEST_F(PgppIntegrationTest, FireAndForgetSelfDestructs)
         insertAndCount(pool, "faf_" + std::to_string(i), completionCount);
     }
 
-    // Wait for all to complete
-    for (int i = 0; i < 100 && completionCount.load() < 10; ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
+    EXPECT_TRUE(waitFor([&] { return completionCount.load() == 10; }));
     EXPECT_EQ(completionCount.load(), 10);
 }
 
@@ -114,10 +117,7 @@ TEST_F(PgppIntegrationTest, CoExecPreparedBackwardCompat)
     };
     coro();
 
-    for (int i = 0; i < 50 && !done.load(); ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-    ASSERT_TRUE(done.load());
+    ASSERT_TRUE(waitFor([&] { return done.load(); }));
     ASSERT_TRUE(execResult.has_value());
     EXPECT_TRUE(execResult.value());
     ASSERT_EQ(queryRows.size(), 1u);
@@ -138,10 +138,7 @@ TEST_F(PgppIntegrationTest, CoExecFailingQuery)
     };
     coro();
 
-    for (int i = 0; i < 50 && !done.load(); ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-    ASSERT_TRUE(done.load()) << "Coroutine with failing query should still complete";
+    ASSERT_TRUE(waitFor([&] { return done.load(); })) << "Coroutine with failing query should still complete";
     // Result should indicate failure (false) or no value
     if (result.has_value())
         EXPECT_FALSE(result.value());
@@ -169,10 +166,7 @@ TEST(CoroutineShutdown, CoAwaitOnShutdownPool)
     };
     coro();
 
-    for (int i = 0; i < 50 && !done.load(); ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-    ASSERT_TRUE(done.load()) << "Coroutine on shutdown pool should not hang";
+    ASSERT_TRUE(waitFor([&] { return done.load(); })) << "Coroutine on shutdown pool should not hang";
     // Should return nullopt or false
     EXPECT_TRUE(!result.has_value() || !result.value());
 }

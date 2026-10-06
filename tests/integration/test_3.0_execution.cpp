@@ -234,6 +234,28 @@ TEST_F(PgppConnectionTest, ExecPreparedFloatPrecision)
     EXPECT_NEAR(std::get<0>(rows[0]), 3.141592653589793, 1e-10);
 }
 
+// ── IT-EXEC-014: the no-result overload accepts a statement that returns rows ─
+
+// INSERT ... RETURNING and SELECT answer PGRES_TUPLES_OK. A caller that does
+// not want the rows (execSync, execAsync, exec, coExec) must still get `true`:
+// the statement ran. The rows are discarded (REQ-PGPP-073).
+TEST_F(PgppConnectionTest, ExecPreparedNoResultAcceptsRows)
+{
+    ASSERT_TRUE(conn.prepare({"ins_ret", "INSERT INTO pgpp_test_table (name) VALUES ($1) RETURNING id", {pg::VARCHAR}}));
+    EXPECT_TRUE(conn.execPrepared("ins_ret", std::string("returning")));
+
+    ASSERT_TRUE(conn.prepare({"cnt_name", "SELECT COUNT(*)::int4 FROM pgpp_test_table WHERE name = $1", {pg::VARCHAR}}));
+    EXPECT_TRUE(conn.execPrepared("cnt_name", std::string("returning")));   // SELECT without a result vector
+
+    std::vector<std::tuple<int>> rows;
+    ASSERT_TRUE(conn.execPrepared("cnt_name", rows, std::string("returning")));
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(std::get<0>(rows[0]), 1) << "the INSERT ... RETURNING must have happened";
+
+    // A real failure is still a failure.
+    EXPECT_FALSE(conn.execPrepared("no_such_statement"));
+}
+
 // ── SELECT returning zero rows ─────────────────────────────────────────────
 
 TEST_F(PgppConnectionTest, ExecPreparedZeroRows)

@@ -7,6 +7,19 @@
 #include <future>
 #include <chrono>
 
+namespace {
+
+// Polls `ready` every 10 ms for up to 5 s.
+template<typename Ready>
+bool waitUntil(Ready ready)
+{
+    for (int i = 0; i < 500 && !ready(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    return ready();
+}
+
+} // namespace
+
 // ── IT-POOL-001: initialize with 2 connections ──────────────────────────────
 
 TEST_F(PgppIntegrationTest, PoolInitializeWithConnections)
@@ -150,12 +163,12 @@ TEST_F(PgppIntegrationTest, PoolStatisticsUnderLoad)
     // Fire queries to saturate both connections
     auto f1 = pool.execAsync("stat_slow");
     auto f2 = pool.execAsync("stat_slow");
-    // These will queue since both workers are busy
+    // This one queues since both executor threads are busy
     auto f3 = pool.execAsync("stat_slow");
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ASSERT_TRUE(waitUntil([&] { return pool.busyConnections() == 2; }));
 
-    // Under load: both workers busy, 1 queued
+    // Under load: both connections leased, 1 queued
     EXPECT_EQ(pool.busyConnections(), 2u);
     EXPECT_EQ(pool.freeConnections(), 0u);
     EXPECT_GE(pool.queuedRequests(), 1u);
@@ -166,6 +179,10 @@ TEST_F(PgppIntegrationTest, PoolStatisticsUnderLoad)
 
 // ── IT-POOL-009: shutdown with pending requests ─────────────────────────────
 
+// Pool of one: the executor thread is busy with the slow statement, so the
+// five queued requests can only be drained (nullopt, REQ-PGPP-021). The slow
+// statement itself is cancelled by shutdown() and reports false
+// (REQ-PGPP-076); nothing waits for pg_sleep to finish.
 TEST(PoolShutdown, PendingRequestsGetNullopt)
 {
     auto info = getTestConnectionInfo();
@@ -174,35 +191,36 @@ TEST(PoolShutdown, PendingRequestsGetNullopt)
 
     pool.prepareStatement({"shutdown_test", "SELECT pg_sleep(5)", {}});
 
-    // Fire a slow query
     auto slowFuture = pool.execAsync("shutdown_test");
+    ASSERT_TRUE(waitUntil([&] { return pool.busyConnections() == 1; }));
 
-    // Immediately fire more queries that will queue
     std::vector<std::future<std::optional<bool>>> pending;
     for (int i = 0; i < 5; ++i)
         pending.push_back(pool.execAsync("shutdown_test"));
 
-    // Shutdown while queries are pending
+    const auto start = std::chrono::steady_clock::now();
     pool.shutdown();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    EXPECT_LT(elapsed.count(), 2000) << "shutdown() must cancel the running statement, not wait for it";
 
-    // Pending futures must resolve (not hang) and return nullopt or false
     for (auto& f : pending) {
-        auto result = f.get();
-        EXPECT_TRUE(!result.has_value() || !result.value())
-            << "Pending request after shutdown should be nullopt or false";
+        ASSERT_EQ(f.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+        EXPECT_EQ(f.get(), std::nullopt) << "a request still queued at shutdown is drained with nullopt";
     }
+    ASSERT_EQ(slowFuture.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+    const auto slow = slowFuture.get();
+    ASSERT_TRUE(slow.has_value()) << "the statement in flight was executed, not drained";
+    EXPECT_FALSE(slow.value()) << "a cancelled statement reports failure";
 }
 
 // ── IT-POOL-010: prepareStatement on running pool ───────────────────────────
 
 TEST_F(PgppIntegrationTest, PoolPrepareOnRunningPool)
 {
-    // Pool is already running from SetUp. Add a new statement.
+    // Pool is already running from SetUp. The statement is usable by the very
+    // next request (REQ-PGPP-026): no waiting.
     pool.prepareStatement({"runtime_stmt", "INSERT INTO pgpp_test_table (name) VALUES ($1)", {pg::VARCHAR}});
-
-    // Give workers time to prepare
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
     EXPECT_TRUE(pool.execSync("runtime_stmt", std::string("runtime_user")));
 }
 
@@ -242,14 +260,12 @@ TEST_F(PgppIntegrationTest, DuplicatePrepareStatementHandled)
     // Prepare same name twice — PostgreSQL will reject the second prepare
     // on the same connection, but pool should handle it gracefully
     pool.prepareStatement({"dup_stmt", "INSERT INTO pgpp_test_table (name) VALUES ($1)", {pg::VARCHAR}});
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    // Second prepare with same name — should not crash
-    pool.prepareStatement({"dup_stmt", "INSERT INTO pgpp_test_table (name) VALUES ($1)", {pg::VARCHAR}});
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    // Statement should still work
     EXPECT_TRUE(pool.execSync("dup_stmt", std::string("dup_test_user")));
+
+    // Second registration with the same name: PostgreSQL rejects the duplicate
+    // PREPARE on each connection, the first one stays usable.
+    pool.prepareStatement({"dup_stmt", "INSERT INTO pgpp_test_table (name) VALUES ($1)", {pg::VARCHAR}});
+    EXPECT_TRUE(pool.execSync("dup_stmt", std::string("dup_test_user_2")));
 }
 
 // ── Missing: execPrepared with zero args ────────────────────────────────────
@@ -348,16 +364,90 @@ TEST(PoolShutdownActive, ShutdownDuringSlowQuery)
     PgppPool pool;
     ASSERT_TRUE(pool.initialize(info, 1));
 
-    // Fire a slow query
     auto future = pool.execRawAsync("SELECT pg_sleep(2)");
+    ASSERT_TRUE(waitUntil([&] { return pool.busyConnections() == 1; }));
 
-    // Shutdown immediately — should not hang
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // Shutdown while the statement runs: must not hang
     pool.shutdown();
 
-    // Future must resolve within reasonable time
     auto status = future.wait_for(std::chrono::seconds(5));
     EXPECT_NE(status, std::future_status::timeout) << "Future hung after shutdown";
+}
+
+// ── IT-POOL-021: shutdown cancels the statement in flight (REQ-PGPP-076) ───
+
+// A long statement on an executor thread: shutdown() sends a cancel request
+// to the leased connection, the statement fails at once and the request
+// reports false. Without the cancel, shutdown() waits the full pg_sleep.
+TEST(PoolShutdownActive, ShutdownCancelsInFlightStatement)
+{
+    auto info = getTestConnectionInfo();
+    PgppPool pool;
+    ASSERT_TRUE(pool.initialize(info, 1));
+
+    auto future = pool.execRawAsync("SELECT pg_sleep(4)");
+    ASSERT_TRUE(waitUntil([&] { return pool.busyConnections() == 1; }));
+
+    const auto start = std::chrono::steady_clock::now();
+    pool.shutdown();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    EXPECT_LT(elapsed.count(), 1500) << "shutdown() waited for pg_sleep(4) instead of cancelling it";
+
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+    const auto result = future.get();
+    ASSERT_TRUE(result.has_value());
+    EXPECT_FALSE(result.value()) << "the cancelled statement must report failure";
+}
+
+// The same for a lease held by one of the caller's own threads: the cancel
+// reaches every leased connection, not only the executor's.
+TEST(PoolShutdownActive, ShutdownCancelsLeasedStatement)
+{
+    auto info = getTestConnectionInfo();
+    PgppPool pool;
+    ASSERT_TRUE(pool.initialize(info, 1));
+
+    std::promise<bool> outcome;
+    auto outcomeFuture = outcome.get_future();
+    std::thread holder([&] {
+        auto lease = pool.acquire();
+        outcome.set_value(lease && lease->execRaw("SELECT pg_sleep(4)"));
+    });
+    ASSERT_TRUE(waitUntil([&] { return pool.busyConnections() == 1; }));
+
+    const auto start = std::chrono::steady_clock::now();
+    pool.shutdown();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    holder.join();
+
+    EXPECT_LT(elapsed.count(), 1500) << "shutdown() waited for the leased statement instead of cancelling it";
+    EXPECT_FALSE(outcomeFuture.get()) << "the cancelled statement must report failure";
+}
+
+// ── IT-POOL-022: no-result APIs on a statement that returns rows (REQ-PGPP-073)
+
+TEST_F(PgppIntegrationTest, PoolExecOnSelectSucceeds)
+{
+    pool.prepareStatement({"exec_sel", "SELECT COUNT(*) FROM pgpp_test_table", {}});
+    pool.prepareStatement({"exec_ret", "INSERT INTO pgpp_test_table (name) VALUES ($1) RETURNING id", {pg::VARCHAR}});
+
+    EXPECT_TRUE(pool.execSync("exec_sel"));
+    EXPECT_TRUE(pool.execSync("exec_ret", std::string("ret_sync")));
+
+    auto future = pool.execAsync("exec_ret", std::string("ret_async"));
+    EXPECT_EQ(future.get(), std::optional<bool>(true));
+
+    std::promise<std::optional<bool>> done;
+    pool.exec("exec_sel", [&](std::optional<bool> ok) { done.set_value(ok); });
+    EXPECT_EQ(done.get_future().get(), std::optional<bool>(true));
+
+    using Row = std::tuple<int64_t>;
+    auto [ok, rows] = pool.querySync<Row>("exec_sel");
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(std::get<0>(rows[0]), 2) << "both INSERT ... RETURNING calls must have happened";
 }
 
 // ── Query returning zero rows via pool ─────────────────────────────────────

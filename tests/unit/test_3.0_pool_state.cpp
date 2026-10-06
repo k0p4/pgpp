@@ -161,22 +161,35 @@ TEST(PoolState, PrepareStatementEmptyName)
 
 // ── Callback-based operations on uninitialized pool ─────────────────────────
 
+// A request that cannot be queued fires its callback exactly once, with
+// nullopt, on the calling thread, before exec() returns (REQ-PGPP-033).
 TEST(PoolState, CallbackExecOnUninitializedPool)
 {
     PgppPool pool;
-    bool callbackCalled {};
+    int fired = 0;
+    std::optional<bool> seen = true;
+    std::thread::id callbackThread;
     pool.exec("nonexistent",
-        [&callbackCalled](std::optional<bool> result) {
-            callbackCalled = true;
-            EXPECT_FALSE(result.has_value());
+        [&](std::optional<bool> result) {
+            ++fired;
+            seen = result;
+            callbackThread = std::this_thread::get_id();
         },
         std::string("arg"));
 
-    // Give a moment for the callback (though it should be immediate for rejected requests)
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    // Callback may or may not be called depending on implementation —
-    // the important thing is no crash
-    SUCCEED();
+    EXPECT_EQ(fired, 1);
+    EXPECT_EQ(seen, std::nullopt);
+    EXPECT_EQ(callbackThread, std::this_thread::get_id());
+
+    using Row = std::tuple<int>;
+    fired = 0;
+    pool.query<Row>("nonexistent", [&](std::optional<bool> result, std::vector<Row> rows) {
+        ++fired;
+        seen = result;
+        EXPECT_TRUE(rows.empty());
+    });
+    EXPECT_EQ(fired, 1);
+    EXPECT_EQ(seen, std::nullopt);
 }
 
 TEST(PoolState, TransactionOnUninitializedPool)

@@ -89,6 +89,16 @@ TEST(PoolStress, ConnectionSurvivesBackendKill)
     // follow-up could be round-robined to a healthy worker).
     ASSERT_TRUE(pool.initialize(info, 1));
 
+    // Registered before the kill: the new server session knows nothing about
+    // it, so the reconnect path must prepare it again (REQ-PGPP-043).
+    pool.prepareStatement({"survive_sel", "SELECT 7", {}});
+    using Row = std::tuple<int>;
+    {
+        auto [ok, rows] = pool.querySync<Row>("survive_sel");
+        ASSERT_TRUE(ok);
+        ASSERT_EQ(rows.size(), 1u);
+    }
+
     // Transaction that deliberately kills its own backend. The COMMIT issued
     // by the transaction() helper will fail because the connection is gone
     // → result is `false` (failure), not nullopt.
@@ -99,10 +109,13 @@ TEST(PoolStress, ConnectionSurvivesBackendKill)
     EXPECT_TRUE(killResult.has_value())     << "transaction path must resolve (not hang)";
     EXPECT_FALSE(killResult.value_or(true)) << "transaction must report failure after self-kill";
 
-    // Now prove the pool recovered: next query goes through the same (reset)
-    // connection and must succeed.
-    bool ok = pool.execRawSync("SELECT 1");
-    EXPECT_TRUE(ok) << "pool must auto-reconnect after backend kill";
+    // Now prove the pool recovered: the very next request goes through the
+    // same (reset) connection and must succeed, raw and prepared alike.
+    EXPECT_TRUE(pool.execRawSync("SELECT 1")) << "pool must auto-reconnect after backend kill";
+    auto [ok, rows] = pool.querySync<Row>("survive_sel");
+    EXPECT_TRUE(ok) << "prepared statements must be prepared again on the new session";
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(std::get<0>(rows[0]), 7);
 
     pool.shutdown();
 }
@@ -130,10 +143,9 @@ TEST(PoolStress, CallbackInFlightAtShutdown)
     std::atomic<int> withTrue  { 0 };      // ...and the statement actually ran
     std::atomic<int> drained   { 0 };      // resolved via shutdown drain
 
-    // query<> rather than exec: "cb_sleep" is a SELECT, and exec's no-result
-    // path treats PGRES_TUPLES_OK as a failure (REQ-PGPP-017). The ::text cast
-    // is required: binary results (REQ-PGPP-062) read only textual columns into
-    // std::string, and pg_sleep() is void.
+    // query<> so the result path is covered too. The ::text cast is required:
+    // binary results (REQ-PGPP-062) read only textual columns into std::string,
+    // and pg_sleep() is void.
     using Row = std::tuple<std::string>;
     for (int i = 0; i < kCallbacks; ++i) {
         pool->query<Row>("cb_sleep", [&](std::optional<bool> r, std::vector<Row>) {
@@ -147,13 +159,10 @@ TEST(PoolStress, CallbackInFlightAtShutdown)
         });
     }
 
-    // Shut down while the queue is still building out.
+    // Shut down while the queue is still building out. shutdown() from a
+    // non-executor thread is synchronous (REQ-PGPP-070): when it returns, every
+    // callback has fired.
     pool->shutdown();
-
-    // Give any trailing callbacks a brief moment to run (they execute
-    // synchronously on shutdown's draining thread, but we allow slack for
-    // OS scheduling jitter in CI).
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     EXPECT_EQ(fired.load(), kCallbacks)
         << "every submitted callback must fire exactly once";
@@ -432,8 +441,6 @@ TEST_F(PgppIntegrationTest, ParamUnicode)
 TEST_F(PgppIntegrationTest, ParamEmptyString)
 {
     // Distinct from NULL — empty string must be stored and retrievable as "".
-    // Use a plain INSERT (no RETURNING) so execPrepared's no-result variant
-    // gets PGRES_COMMAND_OK back.
     pool.prepareStatement({"empty_ins",
                            "INSERT INTO pgpp_test_table (name) VALUES ($1)",
                            {pg::VARCHAR}});
@@ -450,13 +457,11 @@ TEST_F(PgppIntegrationTest, ParamEmptyString)
     EXPECT_EQ(std::get<0>(rows[0]), "");
 }
 
-// Documenting a real limitation of the text-format binding: `args.c_str()`
-// hands libpq a NUL-terminated C string, so the portion of the parameter
-// after the first embedded NUL is silently dropped. This test doesn't
-// assert "NUL is preserved" (it isn't) — it asserts the *observable*
-// behaviour so a future switch to length-prefixed binding would surface as
-// a test failure and get noticed.
-TEST_F(PgppIntegrationTest, ParamEmbeddedNulTruncatedByTextFormat)
+// Text-format parameters are NUL-terminated C strings, and PostgreSQL text
+// cannot hold a NUL anyway: the bytes after an embedded NUL would be silently
+// dropped (CWE-158). Such a parameter is rejected instead, nothing is sent
+// (REQ-PGPP-074).
+TEST_F(PgppIntegrationTest, ParamEmbeddedNulIsRejected)
 {
     // "hello\0world" — 11 bytes in the std::string, but .c_str() yields 5.
     std::string withNul("hello");
@@ -468,15 +473,24 @@ TEST_F(PgppIntegrationTest, ParamEmbeddedNulTruncatedByTextFormat)
                            "INSERT INTO pgpp_test_table (name) VALUES ($1)",
                            {pg::VARCHAR}});
     pool.prepareStatement({"nul_sel",
-                           "SELECT name FROM pgpp_test_table WHERE name = 'hello'",
+                           "SELECT name FROM pgpp_test_table WHERE name = $1",
+                           {pg::VARCHAR}});
+    pool.prepareStatement({"nul_cnt",
+                           "SELECT COUNT(*)::int4 FROM pgpp_test_table",
                            {}});
 
-    EXPECT_TRUE(pool.execSync("nul_ins", withNul));
+    EXPECT_FALSE(pool.execSync("nul_ins", withNul)) << "a parameter with an embedded NUL must be refused";
 
     using Row = std::tuple<std::string>;
-    auto [ok, rows] = pool.querySync<Row>("nul_sel");
-    ASSERT_TRUE(ok);
-    ASSERT_EQ(rows.size(), 1u) << "row must match on 'hello' — NUL truncation in effect";
-    EXPECT_EQ(std::get<0>(rows[0]), "hello");
-    EXPECT_EQ(std::get<0>(rows[0]).size(), 5u);
+    auto [selOk, selRows] = pool.querySync<Row>("nul_sel", withNul);
+    EXPECT_FALSE(selOk) << "the result overload refuses it too";
+    EXPECT_TRUE(selRows.empty());
+
+    auto [cntOk, cntRows] = pool.querySync<std::tuple<int>>("nul_cnt");
+    ASSERT_TRUE(cntOk);
+    ASSERT_EQ(cntRows.size(), 1u);
+    EXPECT_EQ(std::get<0>(cntRows[0]), 0) << "nothing was inserted, truncated or otherwise";
+
+    // The NUL-free prefix is an ordinary parameter.
+    EXPECT_TRUE(pool.execSync("nul_ins", std::string("hello")));
 }
