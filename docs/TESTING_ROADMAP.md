@@ -6,7 +6,7 @@ Testing strategy for the pgpp PostgreSQL connection pool library. Tests are divi
 unit tests (no database required) and integration tests (require a running PostgreSQL instance).
 
 **Framework:** GoogleTest v1.14.0 (fetched via FetchContent)
-**Test totals:** 61 unit + 89 integration = 150 test cases
+**Test totals:** 61 unit + 99 integration = 160 test cases
 
 ---
 
@@ -279,6 +279,24 @@ Fixture: `PgppIntegrationTest` (+ standalone pool tests)
 | IT-STRESS-010 | `ParamEmbeddedNulTruncatedByTextFormat` | REQ-PGPP-016 |
 | IT-STRESS-011 | `PrepareStatementRightAfterInitialize` (standalone) — statement registered right after `initialize()` is usable at once | REQ-PGPP-059, REQ-PGPP-026 |
 | IT-STRESS-012 | `ShutdownRightAfterInitializeDoesNotHang` (standalone) — many initialize/shutdown cycles under a watchdog | REQ-PGPP-060, REQ-PGPP-020 |
+
+### test_9.0_reentrancy.cpp — Calling the Pool from Its Own Workers; Lifecycle Races
+
+All standalone (`TEST`, own pools). Tests that can hang run under a watchdog; a deadlock is a
+failed assertion. IT-REENTRY-007..009 are data-race tests whose detector is ThreadSanitizer.
+
+| ID | Test | Requirement |
+|---|---|---|
+| IT-REENTRY-001 | `SyncCallFromCallbackRunsInline` — pool 1, `execRawSync` inside an `exec` callback returns `true` | REQ-PGPP-067 |
+| IT-REENTRY-002 | `FutureGetFromCallbackRunsInline` — pool 1, `execRawAsync(...).get()` inside a callback | REQ-PGPP-067 |
+| IT-REENTRY-003 | `SyncCallInsideTransactionStaysInside` — pool 2, a pool call inside `work` runs on the transaction's backend; rolled back / committed with it | REQ-PGPP-067 |
+| IT-REENTRY-004 | `TransactionFromCallbackCommits` — pool 1, `transaction()` inside a callback | REQ-PGPP-067 |
+| IT-REENTRY-005 | `NestedTransactionUsesSavepoint` — inner abort keeps outer; outer abort undoes a committed inner; same backend | REQ-PGPP-068 |
+| IT-REENTRY-006 | `CallbackIssuedFromCallbackFiresInline` — pool 1, inner callback has run when the outer `exec` returns | REQ-PGPP-067 |
+| IT-REENTRY-007 | `ShutdownFromCallbackCompletesTeardown` — 50 cycles; pending requests resolve; later `shutdown()` and destructor wait for the deferred teardown | REQ-PGPP-069 |
+| IT-REENTRY-008 | `StatsDuringShutdownAreRaceFree` — stats getters looping across initialize/shutdown cycles (TSan) | REQ-PGPP-070 |
+| IT-REENTRY-009 | `ConcurrentInitializeShutdown` — `initialize` and `shutdown` from two threads; end state fully up or fully down (TSan) | REQ-PGPP-070 |
+| IT-REENTRY-010 | `MixedApiStorm` — 6 clients × every API, re-entrant callbacks and transaction work, `shutdown()` mid-storm, pool sizes 1 / 2 / 8; every request completes exactly once | REQ-PGPP-067, REQ-PGPP-069 |
 
 ---
 
