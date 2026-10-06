@@ -267,13 +267,15 @@ Thread-safe connection pool. One worker thread per connection.
 
 | Method | Signature | Description |
 |---|---|---|
-| `transaction` | `template<F> future<optional<bool>> transaction(F&& work)` | Executes `BEGIN`, calls `work(PgppConnection&)`, then `COMMIT`. On exception, executes `ROLLBACK` and resolves with `false`. |
+| `transaction` | `template<F> future<optional<bool>> transaction(F&& work)` | Executes `BEGIN`, calls `work(PgppConnection&)` (returning `void` or a value convertible to `bool`), then `COMMIT`. Executes `ROLLBACK` and resolves with `false` if `work` threw, returned `false`, or left the connection in any state other than a healthy open transaction (a failed statement aborts it). Resolves with `true` only if PostgreSQL reports `COMMIT`. |
 
 **Requirements:**
 
-- **REQ-PGPP-034:** If `BEGIN` fails, resolve with `false` without calling the work function.
+- **REQ-PGPP-034:** If `BEGIN` fails (including a null result), resolve with `false` without calling the work function.
 - **REQ-PGPP-035:** Any exception thrown by `work` must trigger `ROLLBACK` and resolve with `false`.
-- **REQ-PGPP-036:** On successful `COMMIT`, resolve with the result of `PQresultStatus == PGRES_COMMAND_OK`.
+- **REQ-PGPP-036:** `COMMIT` counts as successful only if the result is non-null, `PQresultStatus == PGRES_COMMAND_OK` **and** `PQcmdStatus` equals `"COMMIT"`. PostgreSQL answers a `COMMIT` on an aborted transaction with `PGRES_COMMAND_OK` and the command tag `ROLLBACK`; that must resolve with `false`.
+- **REQ-PGPP-065:** After `work` returns, if `PQtransactionStatus` is not `PQTRANS_INTRANS` (a failed statement left it `PQTRANS_INERROR`; `work` ended the transaction itself; the connection is bad), issue `ROLLBACK` and resolve with `false` without attempting `COMMIT`.
+- **REQ-PGPP-066:** If `work` returns a value convertible to `bool` and it converts to `false`, issue `ROLLBACK` and resolve with `false`. A `void` work behaves as one that returns `true`.
 
 ### 5.7 Raw Enqueue
 
@@ -494,7 +496,7 @@ be distinguishable from failure, and `std::expected<T, E>` where the reason matt
 | REQ-PGPP-033 | Shutdown/enqueue fail delivers nullopt to callback | 5.5 |
 | REQ-PGPP-034 | BEGIN failure resolves with false | 5.6 |
 | REQ-PGPP-035 | Exception triggers ROLLBACK | 5.6 |
-| REQ-PGPP-036 | COMMIT result determines future value | 5.6 |
+| REQ-PGPP-036 | COMMIT succeeded only with status OK and tag "COMMIT" | 5.6 |
 | REQ-PGPP-037 | enqueueRaw holds mutex during push | 5.7 |
 | REQ-PGPP-038 | enqueueRaw returns false if shutting down | 5.7 |
 | REQ-PGPP-039 | freeConnections never underflows | 5.8 |
@@ -523,3 +525,5 @@ be distinguishable from failure, and `std::expected<T, E>` where the reason matt
 | REQ-PGPP-062 | Results requested in binary format; parameters stay text | 4.3 |
 | REQ-PGPP-063 | Fewer result columns than requested fails the query | 4.3 |
 | REQ-PGPP-064 | initialize rolls back on any failure; shutdown drains without allocating | 10 |
+| REQ-PGPP-065 | Aborted (or otherwise not open) transaction after work: ROLLBACK, false | 5.6 |
+| REQ-PGPP-066 | work returning false: ROLLBACK, false | 5.6 |

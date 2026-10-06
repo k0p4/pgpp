@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstring>        // std::strcmp (COMMIT command tag)
 #include <functional>
 #include <future>
 #include <memory>
@@ -32,6 +33,7 @@
 #include <string>
 #include <thread>
 #include <tuple>          // std::tuple, std::apply (bound request arguments)
+#include <type_traits>    // std::decay_t, std::invoke_result_t, std::is_void_v
 #include <utility>        // std::move, std::forward, std::pair
 #include <vector>
 
@@ -369,25 +371,46 @@ std::future<std::optional<bool>> PgppPool::transaction(F&& work) noexcept
                 return;
             }
 
-            PGresult* res = PQexec(conn->connection(), "BEGIN");
-            if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-                PQclear(res);
+            PGconn* pg = conn->connection();
+
+            PGresult* res = PQexec(pg, "BEGIN");
+            const bool begun = res && PQresultStatus(res) == PGRES_COMMAND_OK;
+            PQclear(res);
+            if (!begun) {
                 promise->set_value(false);
                 return;
             }
-            PQclear(res);
 
+            // work may return void, or a value convertible to bool where false
+            // asks for a rollback (REQ-PGPP-066). It is user code, so it is the
+            // one place a throw can originate; it is caught here (REQ-PGPP-035).
+            bool workOk = true;
             try {
-                (*work_)(*conn);
-                res = PQexec(conn->connection(), "COMMIT");
-                const bool ok = (PQresultStatus(res) == PGRES_COMMAND_OK);
-                PQclear(res);
-                promise->set_value(ok);
+                if constexpr (std::is_void_v<std::invoke_result_t<std::decay_t<F>&, PgppConnection&>>) {
+                    (*work_)(*conn);
+                } else {
+                    workOk = static_cast<bool>((*work_)(*conn));
+                }
             } catch (...) {
-                res = PQexec(conn->connection(), "ROLLBACK");
-                PQclear(res);
-                promise->set_value(false);
+                workOk = false;
             }
+
+            // A failed statement leaves the transaction aborted (PQTRANS_INERROR),
+            // and COMMIT on an aborted transaction answers "ROLLBACK" with
+            // PGRES_COMMAND_OK. Only a healthy open transaction may be committed
+            // (REQ-PGPP-065).
+            if (!workOk || PQtransactionStatus(pg) != PQTRANS_INTRANS) {
+                PQclear(PQexec(pg, "ROLLBACK"));
+                promise->set_value(false);
+                return;
+            }
+
+            res = PQexec(pg, "COMMIT");
+            const bool committed = res
+                && PQresultStatus(res) == PGRES_COMMAND_OK
+                && std::strcmp(PQcmdStatus(res), "COMMIT") == 0;   // REQ-PGPP-036
+            PQclear(res);
+            promise->set_value(committed);
         };
         if (!enqueueRaw(std::move(request))) [[unlikely]] {
             promise->set_value(std::nullopt);

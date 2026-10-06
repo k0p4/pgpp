@@ -10,7 +10,7 @@ Convenient C++23 wrapper over libpq with connection pooling, prepared statements
 - **Multiple APIs** — sync, future, callback, C++20 coroutines
 - **Auto-reconnect** — dead connections are restored transparently
 - **Prepared statements** — registered once, available on all connections
-- **Transactions** — auto-rollback on exception
+- **Transactions** — auto-rollback on a failed statement, `return false` or exception
 - **Raw SQL** — for migrations, DDL, one-off queries
 - **Optional logging** — zero-overhead no-op by default, [alog](https://github.com/ihor-drachuk/alog) integration available
 - **C++23**, no exceptions, binary result decoding, depends only on libpq
@@ -61,11 +61,11 @@ future.get();  // std::optional<bool>
 // Coroutines (C++20)
 auto [ok2, rows2] = co_await coQuery<Row>(db, "find_user", name);
 
-// Transactions (auto-rollback on exception)
-db.transaction([](PgppConnection& conn) {
-    conn.execRaw("UPDATE wallet SET balance = balance - 100 WHERE id = '1'");
-    conn.execRaw("UPDATE wallet SET balance = balance + 100 WHERE id = '2'");
-}).get();
+// Transactions: ROLLBACK and false if a statement fails, work returns false, or throws
+auto committed = db.transaction([](PgppConnection& conn) {
+    return conn.execRaw("UPDATE wallet SET balance = balance - 100 WHERE id = '1'")
+        && conn.execRaw("UPDATE wallet SET balance = balance + 100 WHERE id = '2'");
+}).get();   // std::optional<bool>: nullopt only when the pool is shutting down
 ```
 
 See the [Usage Guide](docs/usage.md) for detailed API reference, coroutine examples, transactions, logging configuration, and more.
