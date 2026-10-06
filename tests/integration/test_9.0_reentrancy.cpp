@@ -523,7 +523,7 @@ TEST(PoolReentrancy, MixedApiStorm)
                             break;
                         case 1:
                             issued->fetch_add(1);
-                            pool->querySync<CountRow>("r_pid");
+                            (void)pool->querySync<CountRow>("r_pid");
                             completed->fetch_add(1);
                             break;
                         case 2: {

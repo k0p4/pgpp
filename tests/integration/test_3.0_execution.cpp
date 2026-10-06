@@ -2,6 +2,8 @@
 
 #include "integration_fixture.h"
 
+#include <optional>
+
 // ── IT-EXEC-001: execRaw CREATE/DROP ────────────────────────────────────────
 
 TEST_F(PgppConnectionTest, ExecRawCreateDrop)
@@ -254,6 +256,52 @@ TEST_F(PgppConnectionTest, ExecPreparedNoResultAcceptsRows)
 
     // A real failure is still a failure.
     EXPECT_FALSE(conn.execPrepared("no_such_statement"));
+}
+
+// ── IT-EXEC-015: std::optional columns and parameters (REQ-PGPP-075) ────────
+
+// NULL is indistinguishable from 0 / "" / false in a plain column; a
+// std::optional column makes it nullopt, and a nullopt parameter is SQL NULL.
+TEST_F(PgppConnectionTest, ExecPreparedOptionalColumnsAndParams)
+{
+    ASSERT_TRUE(conn.prepare({"opt_ins", "INSERT INTO pgpp_test_table (name, score) VALUES ($1, $2)", {pg::VARCHAR, pg::INT4}}));
+    ASSERT_TRUE(conn.prepare({"opt_sel", "SELECT name, score, rating FROM pgpp_test_table WHERE name = $1", {pg::VARCHAR}}));
+    ASSERT_TRUE(conn.prepare({"opt_null_name", "SELECT COUNT(*)::int4 FROM pgpp_test_table WHERE name IS NULL AND score IS NULL", {}}));
+
+    const std::optional<std::string> noScore;
+    EXPECT_TRUE(conn.execPrepared("opt_ins", std::string("scored"), std::optional<std::string>("42")));
+    EXPECT_TRUE(conn.execPrepared("opt_ins", std::string("unscored"), noScore));
+    EXPECT_TRUE(conn.execPrepared("opt_ins", noScore, noScore));
+
+    using Row = std::tuple<std::optional<std::string>, std::optional<int>, std::optional<double>>;
+    std::vector<Row> rows;
+    ASSERT_TRUE(conn.execPrepared("opt_sel", rows, std::string("scored")));
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(std::get<0>(rows[0]), std::optional<std::string>("scored"));
+    EXPECT_EQ(std::get<1>(rows[0]), std::optional<int>(42));
+    EXPECT_EQ(std::get<2>(rows[0]), std::optional<double>(0.0));   // column default, not NULL
+
+    rows.clear();
+    ASSERT_TRUE(conn.execPrepared("opt_sel", rows, std::string("unscored")));
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(std::get<1>(rows[0]), std::nullopt) << "a NULL score must not read as 0";
+
+    std::vector<std::tuple<int>> count;
+    ASSERT_TRUE(conn.execPrepared("opt_null_name", count));
+    ASSERT_EQ(count.size(), 1u);
+    EXPECT_EQ(std::get<0>(count[0]), 1) << "nullopt parameters must be inserted as NULL";
+
+    // A plain (non-optional) column still reads NULL as the default (REQ-PGPP-008).
+    std::vector<std::tuple<std::string, int>> plain;
+    ASSERT_TRUE(conn.execPrepared("opt_sel", plain, std::string("unscored")));
+    ASSERT_EQ(plain.size(), 1u);
+    EXPECT_EQ(std::get<1>(plain[0]), 0);
+
+    // Decoding errors are reported through an optional column like any other.
+    ASSERT_TRUE(conn.prepare({"opt_bad", "SELECT 3000000000::bigint", {}}));
+    std::vector<std::tuple<std::optional<int>>> bad;
+    EXPECT_FALSE(conn.execPrepared("opt_bad", bad));
+    EXPECT_TRUE(bad.empty());
 }
 
 // ── SELECT returning zero rows ─────────────────────────────────────────────

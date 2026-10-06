@@ -41,15 +41,35 @@
 struct PgppConnectionInfo {
     std::string dbname;
     std::string host;
-    std::string sslmode;
-    std::string options;
+    std::string sslmode;      // empty = libpq's default ("prefer": encrypted if offered, no verification)
+    std::string options;      // server options, e.g. "-c statement_timeout=5000"
     std::string user;
     std::string password;
     uint16_t    port { 5432 };
 
+    // Seconds to wait for a connection to be established; 0 = libpq's default
+    // (no limit). Passed as connect_timeout (REQ-PGPP-077).
+    int connectTimeoutSeconds { 0 };
+
+    // Any other libpq keywords, appended verbatim at the end of the connection
+    // string so they can also override the fields above, e.g.
+    // "sslrootcert='/etc/ssl/root.crt' channel_binding=require" (REQ-PGPP-077).
+    // Quote values that contain spaces or quotes the libpq way.
+    std::string libpqParams;
+
     // How long acquire() and the synchronous API wait for a free connection
     // before giving up (REQ-PGPP-067). 0 waits without limit.
     std::chrono::milliseconds acquireTimeout { 30000 };
+
+    // Upper bound on requests waiting for an executor thread; a request beyond
+    // it is refused at once (nullopt). 0 = unbounded (REQ-PGPP-078).
+    size_t maxQueuedRequests { 0 };
+
+    // Reset session state (SET, SET ROLE, LISTEN, advisory locks, temporary
+    // tables, sequences) every time a connection is returned, so nothing a
+    // caller did leaks into the next one. One extra round trip per request
+    // (REQ-PGPP-080). Prepared statements survive.
+    bool resetSessionAfterRequest { false };
 };
 
 struct PgppRequest;
@@ -105,10 +125,18 @@ public:
     PgppPool(const PgppPool&) = delete;
     PgppPool& operator=(const PgppPool&) = delete;
 
+    // poolSize 0 = min(hardware_concurrency(), 8), or 8 when unknown (REQ-PGPP-079).
     bool initialize(const PgppConnectionInfo& dbInfo, size_t poolSize = 0) noexcept;
+    // Cancels the statement in flight on every leased connection (REQ-PGPP-076).
     void shutdown() noexcept;
     bool isInitialized() const noexcept;
-    void prepareStatement(const Statement& statement) noexcept;
+    // false if the statement could not be registered (allocation); it is then
+    // prepared on no connection.
+    bool prepareStatement(const Statement& statement) noexcept;
+
+    // The libpq connection string initialize() builds from dbInfo; empty if
+    // dbname is empty (REQ-PGPP-001..003, 077). Contains the password.
+    static std::string buildConnectionString(const PgppConnectionInfo& dbInfo) noexcept;
 
     // Every public function is noexcept (REQ-PGPP-061): whatever fails inside
     // (allocation, copying an argument, a mutex or thread error, a throwing
@@ -116,33 +144,34 @@ public:
 
     // A connection for the calling thread; empty if none became free within
     // acquireTimeout, or the pool is not running.
-    Lease acquire() noexcept;
+    [[nodiscard]] Lease acquire() noexcept;
 
     // Synchronous (on the calling thread, no executor involved)
     template<typename... Ts>
     bool execSync(const std::string& statement, const Ts&... args) noexcept;
 
     template<typename RowTuple, typename... Ts>
-    std::pair<bool, std::vector<RowTuple>> querySync(const std::string& statement, const Ts&... args) noexcept;
+    [[nodiscard]] std::pair<bool, std::vector<RowTuple>> querySync(const std::string& statement, const Ts&... args) noexcept;
 
     bool execRawSync(const std::string& sql) noexcept;
 
     template<typename F>
-    bool transactionSync(F&& work) noexcept;
+    [[nodiscard]] bool transactionSync(F&& work) noexcept;
 
     // Future-based. A future that could not even be allocated is returned
-    // invalid (valid() == false).
+    // invalid (valid() == false). Discarding the future does not cancel the
+    // request; whatever the task captured by reference must outlive it.
     template<typename... Ts>
-    std::future<std::optional<bool>> execAsync(const std::string& statement, const Ts&... args) noexcept;
+    [[nodiscard]] std::future<std::optional<bool>> execAsync(const std::string& statement, const Ts&... args) noexcept;
 
     template<typename RowTuple, typename... Ts>
-    std::future<std::pair<std::optional<bool>, std::vector<RowTuple>>>
+    [[nodiscard]] std::future<std::pair<std::optional<bool>, std::vector<RowTuple>>>
         queryAsync(const std::string& statement, const Ts&... args) noexcept;
 
-    std::future<std::optional<bool>> execRawAsync(const std::string& sql) noexcept;
+    [[nodiscard]] std::future<std::optional<bool>> execRawAsync(const std::string& sql) noexcept;
 
     template<typename F>
-    std::future<std::optional<bool>> transaction(F&& work) noexcept;
+    [[nodiscard]] std::future<std::optional<bool>> transaction(F&& work) noexcept;
 
     // Callback-based (runs on an executor thread, after the statement's
     // connection was returned). Fires exactly once; with nullopt on the calling
@@ -168,10 +197,9 @@ public:
 
 private:
     // ── Connections ──────────────────────────────────────────────────────────
-    size_t      m_poolSize { std::thread::hardware_concurrency() };
-    std::string m_connectionString;
+    size_t m_poolSize { 0 };   // set by the constructor (REQ-PGPP-079)
 
-    mutable std::mutex        m_mutex;            // m_all, m_idle, m_leased, m_stopping, m_acquireTimeout
+    mutable std::mutex        m_mutex;            // m_all, m_idle, m_leased, m_stopping, m_acquireTimeout, Slot::leased / cancel
     std::condition_variable   m_idleAvailable;
     std::vector<std::unique_ptr<Slot>> m_all;     // fixed between initialize and shutdown
     std::vector<Slot*>        m_idle;             // free-list (LIFO)
@@ -180,10 +208,11 @@ private:
     std::chrono::milliseconds m_acquireTimeout { 30000 };
 
     // ── Executor ─────────────────────────────────────────────────────────────
-    mutable std::mutex                       m_taskMutex;   // m_tasks, m_taskStopping, m_threadIds
+    mutable std::mutex                       m_taskMutex;   // m_tasks, m_taskStopping, m_maxQueued, m_threadIds
     std::condition_variable                  m_taskAvailable;
     std::deque<std::unique_ptr<PgppRequest>> m_tasks;
     bool                                     m_taskStopping { false };
+    size_t                                   m_maxQueued { 0 };
     std::vector<std::thread>                 m_threads;     // touched under m_lifecycleMutex only
     std::vector<std::thread::id>             m_threadIds;
 
@@ -198,6 +227,8 @@ private:
     Lease acquireFor(std::optional<std::chrono::milliseconds> timeout) noexcept;
     bool  prepareForUse(Slot& slot) noexcept;
     void  releaseSlot(Slot* slot) noexcept;
+    void  refreshCancel(Slot& slot) noexcept;
+    void  cancelLeased() noexcept;
     bool  createConnections(const PgppConnectionInfo& dbInfo) noexcept;
     void  closeConnections() noexcept;
     void  waitForLeases() noexcept;
@@ -212,12 +243,6 @@ private:
     bool  initializeLocked(const PgppConnectionInfo& dbInfo, size_t poolSize) noexcept;
     void  shutdownLocked() noexcept;
     void  requestStop() noexcept;
-
-    std::string buildConnectionString(const PgppConnectionInfo& dbInfo) const noexcept;
-
-#ifdef PGPP_TESTING
-    friend class PgppPoolTest;
-#endif
 };
 
 // A unit of work for the executor: runs with a lease (empty when the pool is

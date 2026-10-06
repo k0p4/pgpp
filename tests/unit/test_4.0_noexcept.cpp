@@ -86,6 +86,13 @@ TEST(NoExceptions, PublicApiIsNoexcept)
     static_assert(noexcept(pool.transactionSync([](PgppConnection&) { return false; })));
     static_assert(noexcept(pool.acquire()));
     static_assert(noexcept(pool.queuedRequests()));
+    static_assert(noexcept(PgppPool::buildConnectionString(info)));
+
+    // std::optional parameters and columns instantiate the same noexcept paths.
+    std::optional<std::string> opt;
+    static_assert(noexcept(pool.execSync(s, opt)));
+    static_assert(noexcept(pool.querySync<std::tuple<std::optional<int>>>(s, opt)));
+    static_assert(noexcept(pool.queryAsync<std::tuple<std::optional<std::string>>>(s, opt)));
 
     PgppConnection conn;
     static_assert(noexcept(conn.open(s)));

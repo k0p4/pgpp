@@ -6,6 +6,8 @@
 #include <vector>
 #include <future>
 #include <chrono>
+#include <algorithm>
+#include <optional>
 
 namespace {
 
@@ -448,6 +450,87 @@ TEST_F(PgppIntegrationTest, PoolExecOnSelectSucceeds)
     ASSERT_TRUE(ok);
     ASSERT_EQ(rows.size(), 1u);
     EXPECT_EQ(std::get<0>(rows[0]), 2) << "both INSERT ... RETURNING calls must have happened";
+}
+
+// ── IT-POOL-023: bounded queue (REQ-PGPP-078) ───────────────────────────────
+
+// Pool of one whose connection is held by the test: the executor thread takes
+// the first request and blocks acquiring; the next `maxQueuedRequests` wait in
+// the queue; one more is refused at once with nullopt. Nothing is lost: once
+// the connection is returned every accepted request completes.
+TEST(PoolQueueLimit, ExcessRequestsAreRefusedAtOnce)
+{
+    auto info = getTestConnectionInfo();
+    info.maxQueuedRequests = 2;
+    PgppPool pool;
+    ASSERT_TRUE(pool.initialize(info, 1));
+
+    std::vector<std::future<std::optional<bool>>> accepted;
+    {
+        auto held = pool.acquire();
+        ASSERT_TRUE(held);
+
+        accepted.push_back(pool.execRawAsync("SELECT 1"));
+        ASSERT_TRUE(waitUntil([&] { return pool.queuedRequests() == 0; }))
+            << "the executor thread must have taken the first request";
+        accepted.push_back(pool.execRawAsync("SELECT 2"));
+        accepted.push_back(pool.execRawAsync("SELECT 3"));
+        EXPECT_EQ(pool.queuedRequests(), 2u);
+
+        auto refused = pool.execRawAsync("SELECT 4");
+        ASSERT_EQ(refused.wait_for(std::chrono::seconds(0)), std::future_status::ready)
+            << "a refused request resolves immediately";
+        EXPECT_EQ(refused.get(), std::nullopt);
+        EXPECT_EQ(pool.queuedRequests(), 2u);
+
+        // The callback API reports the refusal the same way, on the calling thread.
+        pool.prepareStatement({"ql_one", "SELECT 1", {}});
+        int fired = 0;
+        std::optional<bool> seen = true;
+        pool.exec("ql_one", [&](std::optional<bool> r) { ++fired; seen = r; });
+        EXPECT_EQ(fired, 1);
+        EXPECT_EQ(seen, std::nullopt);
+    }   // connection returned
+
+    for (auto& f : accepted) {
+        EXPECT_EQ(f.get(), std::optional<bool>(true));
+    }
+    pool.shutdown();
+}
+
+// ── IT-POOL-024: default pool size (REQ-PGPP-079) ──────────────────────────
+
+TEST(PoolDefaults, DefaultPoolSizeIsOnePerCoreUpToEight)
+{
+    PgppPool pool;
+    ASSERT_TRUE(pool.initialize(getTestConnectionInfo()));   // poolSize 0 = default
+    const size_t cores    = std::thread::hardware_concurrency();
+    const size_t expected = cores == 0 ? 8 : std::min<size_t>(cores, 8);
+    EXPECT_EQ(pool.totalConnections(), expected);
+    pool.shutdown();
+}
+
+// ── IT-POOL-025: std::optional through the pool APIs (REQ-PGPP-075) ─────────
+
+TEST_F(PgppIntegrationTest, PoolOptionalParamsAndColumns)
+{
+    pool.prepareStatement({"popt_ins", "INSERT INTO pgpp_test_table (name, score) VALUES ($1, $2)", {pg::VARCHAR, pg::INT4}});
+    pool.prepareStatement({"popt_sel", "SELECT score FROM pgpp_test_table WHERE name = $1", {pg::VARCHAR}});
+
+    const std::optional<std::string> null;
+    EXPECT_TRUE(pool.execSync("popt_ins", std::string("n"), null));
+    EXPECT_EQ(pool.execAsync("popt_ins", std::string("v"), std::optional<std::string>("5")).get(), std::optional<bool>(true));
+
+    using Row = std::tuple<std::optional<int>>;
+    auto [ok, rows] = pool.querySync<Row>("popt_sel", std::string("n"));
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(std::get<0>(rows[0]), std::nullopt);
+
+    auto [ok2, rows2] = pool.queryAsync<Row>("popt_sel", std::string("v")).get();
+    ASSERT_EQ(ok2, std::optional<bool>(true));
+    ASSERT_EQ(rows2.size(), 1u);
+    EXPECT_EQ(std::get<0>(rows2[0]), std::optional<int>(5));
 }
 
 // ── Query returning zero rows via pool ─────────────────────────────────────

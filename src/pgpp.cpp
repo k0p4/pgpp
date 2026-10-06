@@ -29,8 +29,19 @@ PGPP_DEFINE_LOG_MODULE(PgppPool)
 // One pooled connection and how far it has caught up with the statement list.
 struct PgppPool::Slot {
     std::unique_ptr<PgppConnection> conn;
-    size_t preparedCount { 0 };   // statements [0, preparedCount) are prepared on conn
+    size_t    preparedCount { 0 };    // statements [0, preparedCount) are prepared on conn
+    bool      leased { false };       // under m_mutex
+    PGcancel* cancel { nullptr };     // under m_mutex; a cancel request can be sent from any thread
+    bool      resetSession { false }; // PgppConnectionInfo::resetSessionAfterRequest
+
+    ~Slot() { PQfreeCancel(cancel); }   // accepts nullptr
 };
+
+// DISCARD ALL minus DEALLOCATE ALL (prepared statements stay) and DISCARD PLANS,
+// so every per-session effect a caller can have is undone (REQ-PGPP-080).
+static const char* const kResetSessionSql =
+    "SET SESSION AUTHORIZATION DEFAULT; RESET ALL; CLOSE ALL; UNLISTEN *; "
+    "SELECT pg_advisory_unlock_all(); DISCARD TEMP; DISCARD SEQUENCES";
 
 // ── Lease ────────────────────────────────────────────────────────────────────
 
@@ -88,7 +99,7 @@ static std::string escapeConnValue(const std::string& v)
     return out;
 }
 
-std::string PgppPool::buildConnectionString(const PgppConnectionInfo& dbInfo) const noexcept
+std::string PgppPool::buildConnectionString(const PgppConnectionInfo& dbInfo) noexcept
 {
     try {
         std::string connStr;
@@ -125,6 +136,14 @@ std::string PgppPool::buildConnectionString(const PgppConnectionInfo& dbInfo) co
             connStr += "options=" + escapeConnValue(dbInfo.options) + " ";
         }
 
+        if (dbInfo.connectTimeoutSeconds > 0) {
+            connStr += "connect_timeout=" + std::to_string(dbInfo.connectTimeoutSeconds) + " ";
+        }
+
+        // Last, so a keyword given here overrides the fields above (libpq takes
+        // the last occurrence).
+        connStr += dbInfo.libpqParams;
+
         PGPP_LOGD << "Connection: host=\"" << dbInfo.host
                   << "\" port=" << dbInfo.port
                   << " dbname=\"" << dbInfo.dbname
@@ -142,8 +161,10 @@ std::string PgppPool::buildConnectionString(const PgppConnectionInfo& dbInfo) co
 bool PgppPool::createConnections(const PgppConnectionInfo& dbInfo) noexcept
 {
     try {
-        m_connectionString = buildConnectionString(dbInfo);
-        if (m_connectionString.empty()) {
+        // Local on purpose: the password is not kept around after connecting
+        // (libpq holds what PQreset needs).
+        const std::string connectionString = buildConnectionString(dbInfo);
+        if (connectionString.empty()) {
             PGPP_LOGE << "Failed to build connection string";
             return false;
         }
@@ -151,7 +172,8 @@ bool PgppPool::createConnections(const PgppConnectionInfo& dbInfo) noexcept
         for (size_t i = 0; i < m_poolSize; ++i) {
             auto slot = std::make_unique<Slot>();
             slot->conn = std::make_unique<PgppConnection>();
-            if (!slot->conn->open(m_connectionString)) [[unlikely]] {
+            slot->resetSession = dbInfo.resetSessionAfterRequest;
+            if (!slot->conn->open(connectionString)) [[unlikely]] {
                 PGPP_LOGE << "Failed to create connection " << i << ": " << slot->conn->lastError();
                 return false;
             }
@@ -159,6 +181,7 @@ bool PgppPool::createConnections(const PgppConnectionInfo& dbInfo) noexcept
                 return false;
             }
             std::lock_guard<std::mutex> lock(m_mutex);
+            refreshCancel(*slot);
             m_idle.push_back(slot.get());
             m_all.push_back(std::move(slot));
         }
@@ -200,6 +223,12 @@ bool PgppPool::prepareForUse(Slot& slot) noexcept
             return false;
         }
         slot.preparedCount = 0;   // the server session is new: nothing is prepared
+        try {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            refreshCancel(slot);  // the new backend has a new cancel key
+        } catch (...) {
+            PGPP_LOGE << "Failed to lock while refreshing the cancel handle";
+        }
         PGPP_LOGD << "Connection restored";
     }
 
@@ -263,6 +292,7 @@ PgppPool::Lease PgppPool::acquireFor(std::optional<std::chrono::milliseconds> ti
         }
         slot = m_idle.back();
         m_idle.pop_back();
+        slot->leased = true;
         ++m_leased;
     } catch (...) {
         PGPP_LOGE << "Failed to wait for a connection (mutex or condition-variable error)";
@@ -278,7 +308,8 @@ PgppPool::Lease PgppPool::acquireFor(std::optional<std::chrono::milliseconds> ti
 }
 
 // A connection comes back clean: a caller that left a transaction open or
-// aborted must not hand it to the next caller (REQ-PGPP-072).
+// aborted must not hand it to the next caller (REQ-PGPP-072), and with
+// resetSessionAfterRequest neither must any session state (REQ-PGPP-080).
 void PgppPool::releaseSlot(Slot* slot) noexcept
 {
     PgppConnection& conn = *slot->conn;
@@ -290,10 +321,23 @@ void PgppPool::releaseSlot(Slot* slot) noexcept
                       << " transaction: rolling back";
             Internal::execCommand(conn.connection(), "ROLLBACK", nullptr);
         }
+        if (slot->resetSession && !Internal::execCommand(conn.connection(), kResetSessionSql, nullptr)) {
+            // Cannot vouch for this session any more: start a new one.
+            PGPP_LOGW << "Session reset failed: " << conn.lastError() << "; reconnecting";
+            conn.reset();
+            slot->preparedCount = 0;
+            try {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                refreshCancel(*slot);
+            } catch (...) {
+                PGPP_LOGE << "Failed to lock while refreshing the cancel handle";
+            }
+        }
     }
 
     try {
         std::lock_guard<std::mutex> lock(m_mutex);
+        slot->leased = false;
         --m_leased;
         if (m_stopping) {
             conn.close();
@@ -304,6 +348,36 @@ void PgppPool::releaseSlot(Slot* slot) noexcept
         PGPP_LOGE << "Failed to lock while returning a connection";
     }
     m_idleAvailable.notify_all();   // a waiting acquire, or shutdown waiting for leases
+}
+
+// Under m_mutex. The cancel handle holds the backend's pid and key, so it must
+// follow every (re)connect.
+void PgppPool::refreshCancel(Slot& slot) noexcept
+{
+    PQfreeCancel(slot.cancel);
+    slot.cancel = slot.conn->isOpen() ? PQgetCancel(slot.conn->connection()) : nullptr;
+}
+
+// Asks the server to abort whatever runs on each leased connection, so a
+// shutdown() does not wait for a long statement to finish (REQ-PGPP-076). The
+// statement fails with "canceling statement due to user request" and the
+// request reports false. PQcancel is safe to call while another thread is
+// inside PQexec on the same connection: it opens its own socket.
+void PgppPool::cancelLeased() noexcept
+{
+    try {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (const auto& slot : m_all) {
+            if (slot->leased && slot->cancel != nullptr) {
+                char errbuf[256];
+                if (!PQcancel(slot->cancel, errbuf, sizeof errbuf)) {
+                    PGPP_LOGW << "Cancel request failed: " << errbuf;
+                }
+            }
+        }
+    } catch (...) {
+        PGPP_LOGE << "Failed to lock while cancelling statements";
+    }
 }
 
 void PgppPool::waitForLeases() noexcept
@@ -398,6 +472,10 @@ bool PgppPool::enqueueRaw(std::unique_ptr<PgppRequest> request) noexcept
         if (m_taskStopping) [[unlikely]] {
             return false;
         }
+        if (m_maxQueued != 0 && m_tasks.size() >= m_maxQueued) [[unlikely]] {
+            PGPP_LOGW << "Request refused: " << m_tasks.size() << " already queued (REQ-PGPP-078)";
+            return false;
+        }
         m_tasks.push_back(std::move(request));
     } catch (...) {
         PGPP_LOGE << "Failed to enqueue a request (allocation or mutex error)";
@@ -459,7 +537,11 @@ bool PgppPool::onExecutorThread() const noexcept
 
 PgppPool::PgppPool()
 {
-    if (m_poolSize == 0) m_poolSize = 16;
+    // One connection per core up to 8: a database serves many clients, and
+    // the server's own limit (max_connections) is the scarce resource
+    // (REQ-PGPP-079).
+    const size_t cores = std::thread::hardware_concurrency();
+    m_poolSize = cores == 0 ? 8 : std::min<size_t>(cores, 8);
 }
 
 PgppPool::~PgppPool()
@@ -504,6 +586,13 @@ bool PgppPool::initializeLocked(const PgppConnectionInfo& dbInfo, size_t poolSiz
         PGPP_LOGE << "initialize: failed to lock";
         return false;
     }
+    try {
+        std::lock_guard<std::mutex> lock(m_taskMutex);
+        m_maxQueued = dbInfo.maxQueuedRequests;
+    } catch (...) {
+        PGPP_LOGE << "initialize: failed to lock";
+        return false;
+    }
 
     if (poolSize > 0) [[likely]] {
         m_poolSize = poolSize;
@@ -526,7 +615,8 @@ bool PgppPool::initializeLocked(const PgppConnectionInfo& dbInfo, size_t poolSiz
 }
 
 // Stop accepting work and wake everyone: acquire() returns empty, the executor
-// drains its queue with empty leases and its threads exit.
+// drains its queue with empty leases and its threads exit, and whatever is
+// running on a leased connection is cancelled.
 void PgppPool::requestStop() noexcept
 {
     m_initialized.store(false);
@@ -538,6 +628,7 @@ void PgppPool::requestStop() noexcept
     }
     m_idleAvailable.notify_all();
     stopExecutor();
+    cancelLeased();
 }
 
 void PgppPool::shutdown() noexcept
@@ -583,14 +674,16 @@ bool PgppPool::isInitialized() const noexcept { return m_initialized.load(); }
 
 // ── Statements ───────────────────────────────────────────────────────────────
 
-void PgppPool::prepareStatement(const Statement& statement) noexcept
+bool PgppPool::prepareStatement(const Statement& statement) noexcept
 {
     // Connections catch up on the next acquire (REQ-PGPP-026): nothing to wake.
     try {
         std::lock_guard<std::mutex> lock(m_stmtMutex);
         m_preparedStatements.push_back(statement);
+        return true;
     } catch (...) {
         PGPP_LOGE << "Failed to register statement " << statement.statementName << " (allocation or mutex error)";
+        return false;
     }
 }
 

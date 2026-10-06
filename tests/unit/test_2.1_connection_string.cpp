@@ -1,15 +1,13 @@
-// UT-CONN-001 through UT-CONN-003: Connection string builder tests
-// Uses PGPP_TESTING friend access to call private buildConnectionString
+// UT-CONN-001 through UT-CONN-017: Connection string builder tests
+// PgppPool::buildConnectionString is a public static function: no friend access.
 
 #include <pgpp/pgpp.h>
 #include <gtest/gtest.h>
 
 class PgppPoolTest : public ::testing::Test {
 protected:
-    PgppPool pool;
-
     std::string build(const PgppConnectionInfo& info) {
-        return pool.buildConnectionString(info);
+        return PgppPool::buildConnectionString(info);
     }
 };
 
@@ -202,6 +200,7 @@ TEST_F(PgppPoolTest, BuildConnectionStringMinimalFields)
     EXPECT_EQ(result.find("password="), std::string::npos);
     EXPECT_EQ(result.find("sslmode="), std::string::npos);
     EXPECT_EQ(result.find("options="), std::string::npos);
+    EXPECT_EQ(result.find("connect_timeout="), std::string::npos);
 }
 
 TEST_F(PgppPoolTest, BuildConnectionStringUnicodeDbname)
@@ -213,4 +212,43 @@ TEST_F(PgppPoolTest, BuildConnectionStringUnicodeDbname)
     std::string result = build(info);
     EXPECT_FALSE(result.empty());
     EXPECT_NE(result.find("dbname="), std::string::npos);
+}
+
+// ── UT-CONN-015..017: connect_timeout and verbatim libpq parameters (REQ-PGPP-077)
+
+TEST_F(PgppPoolTest, BuildConnectionStringConnectTimeout)
+{
+    PgppConnectionInfo info;
+    info.dbname = "testdb";
+    info.host   = "localhost";
+    info.connectTimeoutSeconds = 5;
+
+    std::string result = build(info);
+    EXPECT_NE(result.find("connect_timeout=5 "), std::string::npos) << result;
+}
+
+TEST_F(PgppPoolTest, BuildConnectionStringLibpqParamsAppendedLast)
+{
+    PgppConnectionInfo info;
+    info.dbname     = "testdb";
+    info.host       = "localhost";
+    info.sslmode    = "require";
+    info.libpqParams = "sslrootcert='/etc/ssl/root.crt' channel_binding=require sslmode=verify-full";
+
+    std::string result = build(info);
+    // Verbatim, and after every generated keyword so it can override them
+    // (libpq takes the last occurrence of a keyword).
+    const auto generated = result.find("sslmode='require'");
+    const auto extra     = result.find(info.libpqParams);
+    ASSERT_NE(generated, std::string::npos) << result;
+    ASSERT_NE(extra, std::string::npos) << result;
+    EXPECT_LT(generated, extra);
+    EXPECT_TRUE(result.ends_with(info.libpqParams)) << result;
+}
+
+TEST_F(PgppPoolTest, BuildConnectionStringIsNoexceptStatic)
+{
+    PgppConnectionInfo info;
+    static_assert(noexcept(PgppPool::buildConnectionString(info)));
+    SUCCEED();
 }

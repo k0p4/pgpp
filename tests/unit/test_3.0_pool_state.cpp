@@ -145,8 +145,9 @@ TEST(PoolState, PrepareStatementBeforeInitialize)
     stmt.statement = "SELECT $1";
     stmt.variables = { pg::VARCHAR };
 
-    // Should store the statement without crashing (no connections to prepare on)
-    EXPECT_NO_THROW(pool.prepareStatement(stmt));
+    // Stored for the connections initialize() will create (REQ-PGPP-025);
+    // true means it was registered.
+    EXPECT_TRUE(pool.prepareStatement(stmt));
 }
 
 TEST(PoolState, PrepareStatementEmptyName)
@@ -156,7 +157,7 @@ TEST(PoolState, PrepareStatementEmptyName)
     stmt.statementName = "";
     stmt.statement = "SELECT 1";
 
-    EXPECT_NO_THROW(pool.prepareStatement(stmt));
+    EXPECT_TRUE(pool.prepareStatement(stmt));   // registered; PostgreSQL decides at PREPARE time
 }
 
 // ── Callback-based operations on uninitialized pool ─────────────────────────
