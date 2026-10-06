@@ -1,4 +1,4 @@
-// IT-TXN-001 through IT-TXN-007: Transaction tests
+// IT-TXN-001 through IT-TXN-009: Transaction tests
 
 #include "integration_fixture.h"
 #include <thread>
@@ -87,9 +87,12 @@ TEST_F(PgppIntegrationTest, TransactionConstraintViolationRollback)
     });
 
     auto result = future.get();
-    // Transaction should fail due to constraint violation during COMMIT
-    // (or the INSERT itself fails and the lambda doesn't throw, so COMMIT succeeds
-    //  but no duplicate row exists)
+    // The INSERT fails and execRaw returns false without throwing, which leaves
+    // the transaction aborted. COMMIT on an aborted transaction answers
+    // "ROLLBACK" with PGRES_COMMAND_OK, so the pool must detect the aborted
+    // state itself and report false (REQ-PGPP-065).
+    ASSERT_TRUE(result.has_value());
+    EXPECT_FALSE(result.value());
 
     // Cleanup
     pool.execRawSync("DROP INDEX IF EXISTS pgpp_test_name_uniq");
@@ -169,11 +172,86 @@ TEST_F(PgppIntegrationTest, TransactionDeadlockHandling)
     EXPECT_NE(status1, std::future_status::timeout) << "Transaction 1 hung on deadlock";
     EXPECT_NE(status2, std::future_status::timeout) << "Transaction 2 hung on deadlock";
 
-    // At least one should have failed (the one PostgreSQL chose to abort)
+    // PostgreSQL aborts exactly one side (its second UPDATE fails with a
+    // deadlock error); that side must report false, the other commits.
     auto r1 = f1.get();
     auto r2 = f2.get();
-    bool oneSucceeded = (r1.has_value() && r1.value()) || (r2.has_value() && r2.value());
-    bool oneFailed = (!r1.has_value() || !r1.value()) || (!r2.has_value() || !r2.value());
-    EXPECT_TRUE(oneSucceeded || oneFailed)
-        << "Deadlock: at least one transaction should resolve (success or failure)";
+    ASSERT_TRUE(r1.has_value() && r2.has_value());
+    EXPECT_NE(r1.value(), r2.value()) << "exactly one side of the deadlock may commit";
+
+    // The rows must reflect exactly one transaction: (10, 20) if the first won,
+    // (40, 30) if the second. Any mix means a half-applied transaction.
+    pool.prepareStatement({"txn_lock_score", "SELECT score FROM pgpp_test_table WHERE name = $1", {pg::VARCHAR}});
+    auto [okA, rowsA] = pool.querySync<std::tuple<int>>("txn_lock_score", std::string("lock_a"));
+    auto [okB, rowsB] = pool.querySync<std::tuple<int>>("txn_lock_score", std::string("lock_b"));
+    ASSERT_TRUE(okA && okB);
+    ASSERT_EQ(rowsA.size(), 1u);
+    ASSERT_EQ(rowsB.size(), 1u);
+    const int scoreA = std::get<0>(rowsA[0]);
+    const int scoreB = std::get<0>(rowsB[0]);
+    if (r1.value()) {
+        EXPECT_EQ(scoreA, 10);
+        EXPECT_EQ(scoreB, 20);
+    } else {
+        EXPECT_EQ(scoreA, 40);
+        EXPECT_EQ(scoreB, 30);
+    }
+}
+
+// ── IT-TXN-008: A failed statement rolls the whole transaction back ────────
+
+TEST_F(PgppIntegrationTest, TransactionFailedStatementRollsBack)
+{
+    // The wallet example: the first UPDATE violates a CHECK constraint, the
+    // second would succeed on its own. Neither may be applied, and the result
+    // must say so even though no statement result is checked inside `work`.
+    ASSERT_TRUE(pool.execRawSync("ALTER TABLE pgpp_test_table ADD CONSTRAINT pgpp_test_score_nonneg CHECK (score >= 0)"));
+    ASSERT_TRUE(pool.execRawSync("INSERT INTO pgpp_test_table (name, score) VALUES ('wallet_1', 50), ('wallet_2', 0)"));
+
+    auto result = pool.transaction([](PgppConnection& conn) {
+        conn.execRaw("UPDATE pgpp_test_table SET score = score - 100 WHERE name = 'wallet_1'");
+        conn.execRaw("UPDATE pgpp_test_table SET score = score + 100 WHERE name = 'wallet_2'");
+    }).get();
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_FALSE(result.value());
+
+    pool.prepareStatement({"txn_wallet", "SELECT score FROM pgpp_test_table WHERE name = $1", {pg::VARCHAR}});
+    auto [ok1, rows1] = pool.querySync<std::tuple<int>>("txn_wallet", std::string("wallet_1"));
+    auto [ok2, rows2] = pool.querySync<std::tuple<int>>("txn_wallet", std::string("wallet_2"));
+    ASSERT_TRUE(ok1 && ok2);
+    ASSERT_EQ(rows1.size(), 1u);
+    ASSERT_EQ(rows2.size(), 1u);
+    EXPECT_EQ(std::get<0>(rows1[0]), 50);
+    EXPECT_EQ(std::get<0>(rows2[0]), 0);
+}
+
+// ── IT-TXN-009: `work` returning bool ───────────────────────────────────────
+
+TEST_F(PgppIntegrationTest, TransactionWorkReturnsBool)
+{
+    pool.prepareStatement({"txn_bool_check", "SELECT name FROM pgpp_test_table WHERE name = $1", {pg::VARCHAR}});
+
+    // false: the explicit, non-throwing way to abort (REQ-PGPP-066).
+    auto aborted = pool.transaction([](PgppConnection& conn) {
+        conn.execRaw("INSERT INTO pgpp_test_table (name, score) VALUES ('bool_abort', 1)");
+        return false;
+    }).get();
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_FALSE(aborted.value());
+
+    auto [okA, rowsA] = pool.querySync<std::tuple<std::string>>("txn_bool_check", std::string("bool_abort"));
+    EXPECT_TRUE(okA);
+    EXPECT_TRUE(rowsA.empty());
+
+    // true: committed like a void work.
+    auto committed = pool.transaction([](PgppConnection& conn) {
+        return conn.execRaw("INSERT INTO pgpp_test_table (name, score) VALUES ('bool_commit', 1)");
+    }).get();
+    ASSERT_TRUE(committed.has_value());
+    EXPECT_TRUE(committed.value());
+
+    auto [okC, rowsC] = pool.querySync<std::tuple<std::string>>("txn_bool_check", std::string("bool_commit"));
+    EXPECT_TRUE(okC);
+    EXPECT_EQ(rowsC.size(), 1u);
 }

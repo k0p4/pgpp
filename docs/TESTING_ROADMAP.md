@@ -6,7 +6,7 @@ Testing strategy for the pgpp PostgreSQL connection pool library. Tests are divi
 unit tests (no database required) and integration tests (require a running PostgreSQL instance).
 
 **Framework:** GoogleTest v1.14.0 (fetched via FetchContent)
-**Test totals:** 61 unit + 87 integration = 148 test cases
+**Test totals:** 61 unit + 89 integration = 150 test cases
 
 ---
 
@@ -227,10 +227,12 @@ Fixture: `PgppIntegrationTest`
 | IT-TXN-001 | `TransactionCommitsOnSuccess` | REQ-PGPP-036 |
 | IT-TXN-002 | `TransactionRollsBackOnException` | REQ-PGPP-035 |
 | IT-TXN-003 | `TransactionMultiStatement` | REQ-PGPP-036 |
-| IT-TXN-004 | `TransactionConstraintViolationRollback` | REQ-PGPP-035 |
+| IT-TXN-004 | `TransactionConstraintViolationRollback` — failed INSERT inside `work` resolves `false`, original row intact | REQ-PGPP-065 |
 | IT-TXN-005 | `TransactionEmptyCommits` | REQ-PGPP-036 |
 | IT-TXN-006 | `TransactionManyStatements` | REQ-PGPP-036 |
-| IT-TXN-007 | `TransactionDeadlockHandling` | REQ-PGPP-035 |
+| IT-TXN-007 | `TransactionDeadlockHandling` — exactly one side commits, the victim resolves `false`, rows reflect one transaction only | REQ-PGPP-065 |
+| IT-TXN-008 | `TransactionFailedStatementRollsBack` — wallet example: CHECK violation on the first UPDATE, nothing applied, `false` | REQ-PGPP-065, REQ-PGPP-036 |
+| IT-TXN-009 | `TransactionWorkReturnsBool` — `return false` rolls back and resolves `false`; `return true` commits | REQ-PGPP-066 |
 
 ### test_6.0_raw.cpp — Raw SQL via Pool
 
