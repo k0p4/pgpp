@@ -217,6 +217,14 @@ inline bool execCommand(PGconn* pg, const char* sql, const char* expectedTag) no
     return ok;
 }
 
+// snprintf into a fixed buffer; false if the text did not fit or formatting failed.
+template<typename... Args>
+bool formatSql(char* buffer, size_t size, const char* format, Args... args) noexcept
+{
+    const int written = std::snprintf(buffer, size, format, args...);
+    return written > 0 && static_cast<size_t>(written) < size;
+}
+
 // The caller's statement name and arguments, copied once into shared storage
 // by an ordinary call (where a throwing copy is an ordinary exception). The
 // request task then captures only this pointer, so building it cannot throw,
@@ -426,9 +434,14 @@ std::future<std::optional<bool>> PgppPool::transaction(F&& work) noexcept
             char commitSql[48];
             char rollbackSql[88];
             if (nested) {
-                std::snprintf(beginSql,    sizeof beginSql,    "SAVEPOINT pgpp_sp_%d", depth);
-                std::snprintf(commitSql,   sizeof commitSql,   "RELEASE SAVEPOINT pgpp_sp_%d", depth);
-                std::snprintf(rollbackSql, sizeof rollbackSql, "ROLLBACK TO SAVEPOINT pgpp_sp_%d; RELEASE SAVEPOINT pgpp_sp_%d", depth, depth);
+                const bool formatted =
+                       Internal::formatSql(beginSql,    sizeof beginSql,    "SAVEPOINT pgpp_sp_%d", depth)
+                    && Internal::formatSql(commitSql,   sizeof commitSql,   "RELEASE SAVEPOINT pgpp_sp_%d", depth)
+                    && Internal::formatSql(rollbackSql, sizeof rollbackSql, "ROLLBACK TO SAVEPOINT pgpp_sp_%d; RELEASE SAVEPOINT pgpp_sp_%d", depth, depth);
+                if (!formatted) {
+                    promise->set_value(false);
+                    return;
+                }
             }
 
             if (!Internal::execCommand(pg, nested ? beginSql : "BEGIN", nullptr)) {
