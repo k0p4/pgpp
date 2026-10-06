@@ -5,7 +5,7 @@
 | Tool | Notes |
 |------|-------|
 | C++23 compiler | Needs `std::expected`: MSVC 2022 17.3+, GCC 12+, Clang 16+ with libc++, Clang 19+ with libstdc++ (Clang 18 + libstdc++ hides `<expected>`) |
-| CMake 3.20+ | |
+| CMake 3.20+ | 3.21+ to use `CMakePresets.json` |
 | vcpkg | Set `VCPKG_ROOT` environment variable |
 | Python 3.6+ | Optional — for the build script |
 | Docker | Required for integration tests only |
@@ -99,7 +99,7 @@ build\dev-debug\tests\Debug\pgpp_unit_tests.exe
 
 ### Integration tests
 
-Integration tests cover CRUD operations, pool concurrency, transactions, coroutines, and raw SQL. They require a running PostgreSQL instance.
+Integration tests cover CRUD operations, pool concurrency, transactions, coroutines, raw SQL, calls from the pool's own threads and session hygiene. They require a running PostgreSQL instance.
 
 #### Automatic (Docker)
 
@@ -114,10 +114,37 @@ build\dev-debug\tests\Debug\pgpp_integration_tests.exe
 ```
 
 This will:
-1. Start a `postgres:16-alpine` container named `pgpp-test-pg-7f3a` on port **15432**
+1. Start a `postgres:16-alpine` container named `pgpp-test-pg-7f3a` on **127.0.0.1:15432**
+   (`PGPP_TEST_PG_IMAGE=postgres:13-alpine` picks another server version; CI runs 13 through 17)
 2. Wait for PostgreSQL to accept connections
 3. Run all integration tests
 4. Stop and remove the container
+
+#### Warnings
+
+The library and the tests build with `-Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion`
+(`/W4` on MSVC). CI configures with `-DPGPP_WARNINGS_AS_ERRORS=ON`; do the same locally before
+pushing.
+
+#### Sanitizers
+
+CI runs the whole suite under ThreadSanitizer (job `ThreadSanitizer`) and under AddressSanitizer
+plus UndefinedBehaviorSanitizer (job `AddressSanitizer`). Locally:
+
+```bash
+cmake -S . -B build/tsan -DPGPP_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Debug \
+      -DCMAKE_CXX_FLAGS=-fsanitize=thread -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread
+cmake --build build/tsan -j
+TSAN_OPTIONS="halt_on_error=1" setarch -R ./build/tsan/tests/pgpp_integration_tests
+
+cmake -S . -B build/asan -DPGPP_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Debug \
+      "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer" \
+      "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined"
+cmake --build build/asan -j
+UBSAN_OPTIONS="halt_on_error=1" ./build/asan/tests/pgpp_integration_tests
+```
+
+`setarch -R` (or `sysctl vm.mmap_rnd_bits=28`) is needed for TSan on recent Linux kernels.
 
 #### Manual PostgreSQL
 

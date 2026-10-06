@@ -32,17 +32,22 @@ public:
         // Remove stopped container if exists
         exec("docker rm -f " + std::string(DOCKER_CONTAINER_NAME) + devnull());
 
-        // Start fresh container
+        // PGPP_TEST_PG_IMAGE selects the server version (CI runs 13 through 17).
+        const char* imageEnv = std::getenv("PGPP_TEST_PG_IMAGE");
+        const std::string image = imageEnv && *imageEnv ? imageEnv : DOCKER_IMAGE;
+
+        // Start fresh container. The port is bound to loopback only: the
+        // container runs a superuser with a well-known password.
         std::string runCmd =
             "docker run -d"
             " --name " + std::string(DOCKER_CONTAINER_NAME) +
             " -e POSTGRES_PASSWORD=" + std::string(DB_PASSWORD) +
             " -e POSTGRES_DB=" + std::string(DB_NAME) +
             " -e POSTGRES_USER=" + std::string(DB_USER) +
-            " -p " + std::to_string(DB_PORT) + ":5432"
-            " " + std::string(DOCKER_IMAGE);
+            " -p 127.0.0.1:" + std::to_string(DB_PORT) + ":5432"
+            " " + image;
 
-        std::cout << "[Docker] Starting container: " << DOCKER_CONTAINER_NAME << "\n";
+        std::cout << "[Docker] Starting container: " << DOCKER_CONTAINER_NAME << " (" << image << ")\n";
         int result = exec(runCmd);
         if (result != 0) {
             FAIL() << "Failed to start Docker container. Is Docker running?";

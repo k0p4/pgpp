@@ -68,25 +68,28 @@ pgpp/
 ## Build System
 
 - **CMake 3.20+**, C++23 required (`std::expected`)
-- Static library target: `pgpp`
-- Public dependency: `PostgreSQL::PostgreSQL` (via `find_package`)
+- Static library target: `pgpp` (alias `pgpp::pgpp`)
+- Public dependencies: `PostgreSQL::PostgreSQL`, `Threads::Threads` (via `find_package`)
 - Optional: `alog` logging library (auto-detected, enables `PGPP_USE_ALOG`)
-- Supports PostgreSQL 13-17
+- Warnings: `-Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion` on the library and tests; `-DPGPP_WARNINGS_AS_ERRORS=ON` in CI
+- Supports PostgreSQL 13-17 (CI runs the integration suite on each)
 
 ## Key Classes
 
 ### PgppPool (thread-safe)
-Connection pool with worker-thread-per-connection model. Main entry point for applications.
-- `initialize(PgppConnectionInfo, poolSize)` / `shutdown()`
-- `prepareStatement(Statement)` -- registers prepared statements on all connections
-- `execSync` / `querySync` -- blocking convenience wrappers
-- `execAsync` / `queryAsync` -- return `std::future`
-- `exec` / `query` -- callback-based, fires on worker thread
+Free-list of connections handed out as RAII leases (`acquire()` → `Lease`), plus an executor
+(`poolSize` threads, one queue) for the async APIs. Main entry point for applications.
+- `initialize(PgppConnectionInfo, poolSize)` / `shutdown()` -- poolSize 0 = min(cores, 8); shutdown cancels in-flight statements
+- `prepareStatement(Statement)` -- registers a statement (returns false only if it could not be stored); each connection prepares it on its next acquisition
+- `acquire()` -- a leased connection for the calling thread (waits up to `acquireTimeout`)
+- `execSync` / `querySync` / `execRawSync` / `transactionSync` -- run on the calling thread with their own lease; never use the executor
+- `execAsync` / `queryAsync` -- return `std::future`; run on the executor
+- `exec` / `query` -- callback-based, fires on an executor thread after the connection was returned
 - `transaction(work)` -- BEGIN, `work(conn)` (returns void or bool), COMMIT; ROLLBACK and `false` if a statement failed, `work` returned false or threw
 - `execRawSync` / `execRawAsync` -- non-prepared SQL
 
 ### PgppConnection (NOT thread-safe)
-Single connection wrapper. Used internally by pool workers. Direct use is for testing only.
+Single connection wrapper. Reached through a `PgppPool::Lease`; direct construction is for testing only.
 - `open` / `close` / `reset` / `isOpen` / `lastError`
 - `prepare` / `isPrepared`
 - `execRaw` / `execPrepared` (with and without result vectors)
@@ -111,10 +114,10 @@ When changing API, tests, or build system — update the corresponding docs:
 ## Key Conventions
 
 - **Logging:** Compile-time selectable via `PGPP_USE_ALOG` or `PGPP_USE_STDERR`; defaults to no-op
-- **Threading:** Pool is thread-safe (mutex + condition_variable + atomics). Connection is NOT thread-safe.
-- **Result decoding:** results are fetched in binary format (REQ-PGPP-062) and decoded by column OID into string / any integral type / double / float / bool, range-checked. No text parsing. Non-text columns read into `std::string` need `::text` in SQL; `numeric` needs `::int8`/`::float8`. NULL becomes the C++ default value.
+- **Threading:** Pool is thread-safe; a connection is used only by the holder of its lease, on the holder's thread. Sync API = acquire on the calling thread (no executor, safe from callbacks); async/callback/coroutine/`transaction()` = executor task that acquires, runs, returns the lease, then completes. Inside `transaction()` work use the given connection (a pool call there takes a second connection). Never block on a future inside a callback. `shutdown()` from an executor thread is non-blocking; never destroy the pool from one. A returned connection is rolled back if left in a transaction (REQ-PGPP-072); `resetSessionAfterRequest` also resets session state (REQ-PGPP-080). `maxQueuedRequests` bounds the executor queue (REQ-PGPP-078). The whole suite runs under ThreadSanitizer and ASan/UBSan in CI. Connection is NOT thread-safe.
+- **Result decoding:** results are fetched in binary format (REQ-PGPP-062) and decoded by column OID into string / any integral type / double / float / bool, range-checked. No text parsing. Non-text columns read into `std::string` need `::text` in SQL; `numeric` needs `::int8`/`::float8`. NULL becomes the C++ default value, or `nullopt` in a `std::optional<T>` column (REQ-PGPP-075).
 - **OIDs:** Use `pg::` namespace constants (e.g., `pg::TEXT`, `pg::INT4`), not legacy macros
-- **Parameters:** All query parameters are passed as text-format strings (`.c_str()`); only results are binary
+- **Parameters:** All query parameters are passed as text-format strings (`.c_str()`); `std::optional<std::string>` sends NULL when empty; an embedded NUL is refused (REQ-PGPP-074). Only results are binary. The no-result `execPrepared` accepts statements that return rows (REQ-PGPP-073).
 - **Error handling:** No exception leaves the library (REQ-PGPP-061): every public function is `noexcept`, everything that can throw inside (allocation, argument copies, thread/mutex errors, user callbacks) is caught and turned into the failure value (`false`, `nullopt`, an already-resolved or invalid future, an immediately-completing awaitable). Auto-reconnect via `PQreset` on connection loss. Futures return `nullopt` on shutdown.
 
 ## Testing
@@ -124,7 +127,7 @@ When changing API, tests, or build system — update the corresponding docs:
 - **Integration tests:** Full CRUD, pool concurrency, transactions, coroutines (require PostgreSQL)
 - **Docker fixture:** Integration tests auto-manage a PostgreSQL container via Docker CLI
   - Set `PGPP_SKIP_DOCKER=1` to skip Docker management (e.g. when PostgreSQL is already running)
-  - Container: `pgpp-test-pg-7f3a` on port 15432, image `postgres:16-alpine`
+  - Container: `pgpp-test-pg-7f3a` on 127.0.0.1:15432, image `postgres:16-alpine` (`PGPP_TEST_PG_IMAGE` overrides)
 
 ## Downstream Usage
 

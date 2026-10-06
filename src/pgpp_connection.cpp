@@ -127,6 +127,12 @@ void PgppConnection::logTemplateError(const std::string& statement, int status) 
     PGPP_LOGE << lastError();
 }
 
+void PgppConnection::logParamError(const std::string& statement) noexcept
+{
+    PGPP_LOGE << "Refusing to execute " << statement
+              << ": a parameter contains an embedded NUL (text parameters cannot)";
+}
+
 void PgppConnection::logColumnCountError(const std::string& statement, int columns, int requested) noexcept
 {
     PGPP_LOGE << "Result of " << statement << " has " << columns << " column(s), but "

@@ -1,11 +1,12 @@
 {
-  "version": 6,
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
   "configurePresets": [
     {
       "name": "dev",
       "hidden": true,
-      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
       "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
         "PGPP_BUILD_TESTS": "ON"
       }
     },

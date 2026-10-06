@@ -6,6 +6,19 @@
 #include <chrono>
 #include <thread>
 
+namespace {
+
+// Polls `ready` every 10 ms for up to 5 s.
+template<typename Ready>
+bool waitFor(Ready ready)
+{
+    for (int i = 0; i < 500 && !ready(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    return ready();
+}
+
+} // namespace
+
 // ── IT-CORO-001: coExec executes INSERT ─────────────────────────────────────
 
 TEST_F(PgppIntegrationTest, CoExecInsert)
@@ -15,17 +28,15 @@ TEST_F(PgppIntegrationTest, CoExecInsert)
     std::atomic<bool> done { false };
     std::optional<bool> result;
 
+    // The closure is a named local that outlives the coroutine (the test waits for it); see usage.md.
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-capturing-lambda-coroutines)
     auto coro = [&]() -> FireAndForget {
         result = co_await coExec(pool, "coro_ins", std::string("coro_user"), std::string("42"));
         done.store(true);
     };
     coro();
 
-    // Wait for coroutine to complete
-    for (int i = 0; i < 50 && !done.load(); ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-    ASSERT_TRUE(done.load());
+    ASSERT_TRUE(waitFor([&] { return done.load(); }));
     ASSERT_TRUE(result.has_value());
     EXPECT_TRUE(result.value());
 }
@@ -41,6 +52,8 @@ TEST_F(PgppIntegrationTest, CoQueryReturnsRows)
     std::optional<bool> queryOk;
     std::vector<std::tuple<std::string, int>> queryRows;
 
+    // The closure is a named local that outlives the coroutine (the test waits for it); see usage.md.
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-capturing-lambda-coroutines)
     auto coro = [&]() -> FireAndForget {
         using Row = std::tuple<std::string, int>;
         auto [ok, rows] = co_await coQuery<Row>(pool, "coro_sel", std::string("coro_bob"));
@@ -50,10 +63,7 @@ TEST_F(PgppIntegrationTest, CoQueryReturnsRows)
     };
     coro();
 
-    for (int i = 0; i < 50 && !done.load(); ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-    ASSERT_TRUE(done.load());
+    ASSERT_TRUE(waitFor([&] { return done.load(); }));
     ASSERT_TRUE(queryOk.has_value());
     EXPECT_TRUE(queryOk.value());
     ASSERT_EQ(queryRows.size(), 1u);
@@ -67,10 +77,12 @@ TEST_F(PgppIntegrationTest, CoQueryReturnsRows)
 // (An immediately-invoked *temporary* lambda would be destroyed at the end
 // of the full expression while the frame still references its captures,
 // which ThreadSanitizer reported as a use of dead stack memory.)
-static FireAndForget insertAndCount(PgppPool& pool, std::string name, std::atomic<int>& completionCount)
+// Pointers, not references: the pool and the counter outlive the coroutine,
+// and a pointer makes that an explicit choice rather than a dangling risk.
+static FireAndForget insertAndCount(PgppPool* pool, std::string name, std::atomic<int>* completionCount)
 {
-    co_await coExec(pool, "coro_faf", name);
-    completionCount.fetch_add(1);
+    co_await coExec(*pool, "coro_faf", name);
+    completionCount->fetch_add(1);
 }
 
 TEST_F(PgppIntegrationTest, FireAndForgetSelfDestructs)
@@ -81,13 +93,10 @@ TEST_F(PgppIntegrationTest, FireAndForgetSelfDestructs)
 
     // Launch multiple fire-and-forget coroutines
     for (int i = 0; i < 10; ++i) {
-        insertAndCount(pool, "faf_" + std::to_string(i), completionCount);
+        insertAndCount(&pool, "faf_" + std::to_string(i), &completionCount);
     }
 
-    // Wait for all to complete
-    for (int i = 0; i < 100 && completionCount.load() < 10; ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
+    EXPECT_TRUE(waitFor([&] { return completionCount.load() == 10; }));
     EXPECT_EQ(completionCount.load(), 10);
 }
 
@@ -102,6 +111,8 @@ TEST_F(PgppIntegrationTest, CoExecPreparedBackwardCompat)
     std::optional<bool> execResult;
     std::vector<std::tuple<std::string>> queryRows;
 
+    // The closure is a named local that outlives the coroutine (the test waits for it); see usage.md.
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-capturing-lambda-coroutines)
     auto coro = [&]() -> FireAndForget {
         // Test coExecPrepared alias
         execResult = co_await coExecPrepared(pool, "compat_ins", std::string("compat_user"));
@@ -114,10 +125,7 @@ TEST_F(PgppIntegrationTest, CoExecPreparedBackwardCompat)
     };
     coro();
 
-    for (int i = 0; i < 50 && !done.load(); ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-    ASSERT_TRUE(done.load());
+    ASSERT_TRUE(waitFor([&] { return done.load(); }));
     ASSERT_TRUE(execResult.has_value());
     EXPECT_TRUE(execResult.value());
     ASSERT_EQ(queryRows.size(), 1u);
@@ -132,19 +140,19 @@ TEST_F(PgppIntegrationTest, CoExecFailingQuery)
     std::atomic<bool> done { false };
     std::optional<bool> result;
 
+    // The closure is a named local that outlives the coroutine (the test waits for it); see usage.md.
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-capturing-lambda-coroutines)
     auto coro = [&]() -> FireAndForget {
         result = co_await coExec(pool, "nonexistent_coro_stmt", std::string("arg"));
         done.store(true);
     };
     coro();
 
-    for (int i = 0; i < 50 && !done.load(); ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-    ASSERT_TRUE(done.load()) << "Coroutine with failing query should still complete";
+    ASSERT_TRUE(waitFor([&] { return done.load(); })) << "Coroutine with failing query should still complete";
     // Result should indicate failure (false) or no value
-    if (result.has_value())
+    if (result.has_value()) {
         EXPECT_FALSE(result.value());
+    }
 }
 
 // ── co_await on shutdown pool ──────────────────────────────────────────────
@@ -163,16 +171,15 @@ TEST(CoroutineShutdown, CoAwaitOnShutdownPool)
     std::atomic<bool> done { false };
     std::optional<bool> result;
 
+    // The closure is a named local that outlives the coroutine (the test waits for it); see usage.md.
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-capturing-lambda-coroutines)
     auto coro = [&]() -> FireAndForget {
         result = co_await coExec(pool, "coro_shutdown");
         done.store(true);
     };
     coro();
 
-    for (int i = 0; i < 50 && !done.load(); ++i)
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-    ASSERT_TRUE(done.load()) << "Coroutine on shutdown pool should not hang";
+    ASSERT_TRUE(waitFor([&] { return done.load(); })) << "Coroutine on shutdown pool should not hang";
     // Should return nullopt or false
     EXPECT_TRUE(!result.has_value() || !result.value());
 }

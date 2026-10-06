@@ -107,7 +107,7 @@ TEST(PoolState, EnqueueRawOnUninitializedPool)
 
     auto request = std::make_unique<PgppRequest>();
     bool called = false;
-    request->task = [&called](PgppConnection*) { called = true; };
+    request->task = [&called](PgppPool::Lease) { called = true; };
 
     bool enqueued = pool.enqueueRaw(std::move(request));
     EXPECT_FALSE(enqueued);  // m_initialized is false — must reject
@@ -145,8 +145,9 @@ TEST(PoolState, PrepareStatementBeforeInitialize)
     stmt.statement = "SELECT $1";
     stmt.variables = { pg::VARCHAR };
 
-    // Should store the statement without crashing (no connections to prepare on)
-    EXPECT_NO_THROW(pool.prepareStatement(stmt));
+    // Stored for the connections initialize() will create (REQ-PGPP-025);
+    // true means it was registered.
+    EXPECT_TRUE(pool.prepareStatement(stmt));
 }
 
 TEST(PoolState, PrepareStatementEmptyName)
@@ -156,27 +157,40 @@ TEST(PoolState, PrepareStatementEmptyName)
     stmt.statementName = "";
     stmt.statement = "SELECT 1";
 
-    EXPECT_NO_THROW(pool.prepareStatement(stmt));
+    EXPECT_TRUE(pool.prepareStatement(stmt));   // registered; PostgreSQL decides at PREPARE time
 }
 
 // ── Callback-based operations on uninitialized pool ─────────────────────────
 
+// A request that cannot be queued fires its callback exactly once, with
+// nullopt, on the calling thread, before exec() returns (REQ-PGPP-033).
 TEST(PoolState, CallbackExecOnUninitializedPool)
 {
     PgppPool pool;
-    bool callbackCalled {};
+    int fired = 0;
+    std::optional<bool> seen = true;
+    std::thread::id callbackThread;
     pool.exec("nonexistent",
-        [&callbackCalled](std::optional<bool> result) {
-            callbackCalled = true;
-            EXPECT_FALSE(result.has_value());
+        [&](std::optional<bool> result) {
+            ++fired;
+            seen = result;
+            callbackThread = std::this_thread::get_id();
         },
         std::string("arg"));
 
-    // Give a moment for the callback (though it should be immediate for rejected requests)
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    // Callback may or may not be called depending on implementation —
-    // the important thing is no crash
-    SUCCEED();
+    EXPECT_EQ(fired, 1);
+    EXPECT_EQ(seen, std::nullopt);
+    EXPECT_EQ(callbackThread, std::this_thread::get_id());
+
+    using Row = std::tuple<int>;
+    fired = 0;
+    pool.query<Row>("nonexistent", [&](std::optional<bool> result, std::vector<Row> rows) {
+        ++fired;
+        seen = result;
+        EXPECT_TRUE(rows.empty());
+    });
+    EXPECT_EQ(fired, 1);
+    EXPECT_EQ(seen, std::nullopt);
 }
 
 TEST(PoolState, TransactionOnUninitializedPool)

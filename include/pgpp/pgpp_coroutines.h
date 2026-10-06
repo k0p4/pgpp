@@ -63,15 +63,15 @@ struct FireAndForget
 //
 // The awaitable lives on the awaiting coroutine's frame and keeps its state
 // inline. `await_suspend` hands the pool a PgppRequest whose task captures
-// `this` and runs on a worker thread (or during `shutdown()` drain, with
-// `conn == nullptr`). The task always ends with exactly one
-// `handle.resume()` (pgpp itself never throws, REQ-PGPP-061), so the frame
+// `this` and runs on an executor thread with a leased connection (or during
+// `shutdown()` drain, with an empty lease). The task always ends with exactly
+// one `handle.resume()` (pgpp itself never throws, REQ-PGPP-061), so the frame
 // is alive whenever the task touches it, provided the caller keeps the
 // coroutine alive until it is resumed. FireAndForget satisfies this by
 // construction (its handle isn't exposed, and it self-destructs only after
 // the final return). Destroying a suspended coroutine from outside is UB.
 //
-// After `enqueueRaw` succeeds the worker may resume (and destroy) the frame
+// After `enqueueRaw` succeeds the executor may resume (and destroy) the frame
 // before `await_suspend` returns, so nothing may touch `this` after it.
 
 namespace Internal {
@@ -106,12 +106,13 @@ public:
     {
         try {
             auto request = std::make_unique<PgppRequest>();
-            request->task = [this, handle](PgppConnection* conn) {
-                if (conn) {
+            request->task = [this, handle](PgppPool::Lease lease) {
+                if (lease) {
                     m_result = std::apply(
                         [&](const auto&... a) -> bool {
-                            return static_cast<Derived*>(this)->execute(*conn, a...);
+                            return static_cast<Derived*>(this)->execute(*lease, a...);
                         }, *m_args);
+                    lease.release();   // the coroutine resumes with the connection back in the pool
                 }
                 handle.resume();
             };

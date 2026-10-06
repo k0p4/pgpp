@@ -27,19 +27,20 @@ namespace {
 struct TerminateDiagnostics {
     TerminateDiagnostics()
     {
-        std::set_terminate([] {
-            std::fputs("[pgpp unit tests] std::terminate called", stderr);
+        // Best-effort diagnostics on the way to abort(): a failed write changes nothing.
+        (void)std::set_terminate([] {
+            (void)std::fputs("[pgpp unit tests] std::terminate called", stderr);
             try {
                 if (auto current = std::current_exception()) {
                     std::rethrow_exception(current);
                 }
             } catch (const std::exception& e) {
-                std::fprintf(stderr, " with exception: %s", e.what());
+                (void)std::fprintf(stderr, " with exception: %s", e.what());
             } catch (...) {
-                std::fputs(" with a non-std exception", stderr);
+                (void)std::fputs(" with a non-std exception", stderr);
             }
-            std::fputc('\n', stderr);
-            std::fflush(stderr);
+            (void)std::fputc('\n', stderr);
+            (void)std::fflush(stderr);
             std::abort();
         });
     }
@@ -58,7 +59,7 @@ struct ThrowingArg {
 struct ThrowingWork {
     ThrowingWork() = default;
     ThrowingWork(const ThrowingWork&) { throw std::runtime_error("ThrowingWork copy"); }
-    ThrowingWork(ThrowingWork&&) { throw std::runtime_error("ThrowingWork move"); }
+    ThrowingWork(ThrowingWork&&) { throw std::runtime_error("ThrowingWork move"); }   // NOLINT(performance-noexcept-move-constructor): the point is that it throws
     void operator()(PgppConnection&) const {}
 };
 
@@ -83,7 +84,16 @@ TEST(NoExceptions, PublicApiIsNoexcept)
     static_assert(noexcept(pool.execRawAsync(s)));
     static_assert(noexcept(pool.transaction([](PgppConnection&) {})));
     static_assert(noexcept(pool.transaction([](PgppConnection&) { return false; })));
+    static_assert(noexcept(pool.transactionSync([](PgppConnection&) { return false; })));
+    static_assert(noexcept(pool.acquire()));
     static_assert(noexcept(pool.queuedRequests()));
+    static_assert(noexcept(PgppPool::buildConnectionString(info)));
+
+    // std::optional parameters and columns instantiate the same noexcept paths.
+    std::optional<std::string> opt;
+    static_assert(noexcept(pool.execSync(s, opt)));
+    static_assert(noexcept(pool.querySync<std::tuple<std::optional<int>>>(s, opt)));
+    static_assert(noexcept(pool.queryAsync<std::tuple<std::optional<std::string>>>(s, opt)));
 
     PgppConnection conn;
     static_assert(noexcept(conn.open(s)));
@@ -182,6 +192,8 @@ TEST(NoExceptions, CoroutineArgumentCopyFailureCompletesWithNullopt)
 
     // Both awaitables must complete immediately with nullopt instead of
     // throwing into the coroutine (which FireAndForget would only log).
+    // The closure is a named local that outlives the coroutine (the test waits for it); see usage.md.
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-capturing-lambda-coroutines)
     auto run = [&]() -> FireAndForget {
         execResult = co_await coExec(pool, "stmt", arg);
         auto [ok, rows] = co_await coQuery<std::tuple<int>>(pool, "stmt", arg);

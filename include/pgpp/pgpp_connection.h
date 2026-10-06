@@ -28,10 +28,11 @@
 #include <cstdint>        // int16_t, uint32_t, int64_t
 #include <expected>       // std::expected, std::unexpected
 #include <memory>         // std::unique_ptr
-#include <string>
+#include <optional>       // std::optional (NULL parameters and columns)
+#include <string>         // std::string, std::char_traits
 #include <string_view>
 #include <tuple>
-#include <type_traits>    // std::is_same_v
+#include <type_traits>    // std::is_same_v, std::false_type
 #include <utility>        // std::move, std::in_range, std::index_sequence
 #include <vector>
 
@@ -123,9 +124,16 @@ public:
     bool isPrepared(const std::string& statementName) noexcept;
     bool execRaw(const std::string& sql) noexcept;
 
+    // Parameters are std::string (or anything with .c_str() and .size()), or
+    // std::optional of one where nullopt is SQL NULL (REQ-PGPP-075). A value
+    // with an embedded NUL is refused (REQ-PGPP-074). Result columns are
+    // std::string, any integral type, float, double, bool, or std::optional of
+    // one of those where NULL becomes nullopt.
     template<typename... Ts, typename... TAs>
     bool execPrepared(const std::string& statement, std::vector<std::tuple<TAs...>>& result, const Ts&... args) noexcept;
 
+    // Without results: rows the statement returns (SELECT, INSERT ... RETURNING)
+    // are discarded (REQ-PGPP-073).
     template<typename... Ts>
     bool execPrepared(const std::string& statement, const Ts&... args) noexcept;
 
@@ -133,6 +141,7 @@ public:
 
 private:
     void logTemplateError(const std::string& statement, int status) noexcept;
+    void logParamError(const std::string& statement) noexcept;
     void logConversionError(const std::string& statement, int row) noexcept;
     void logColumnCountError(const std::string& statement, int columns, int requested) noexcept;
     PGconn* m_connection { nullptr };
@@ -161,6 +170,37 @@ enum class ConversionError {
 template<typename T>
 using Converted = std::expected<T, ConversionError>;
 
+template<typename T>
+struct IsOptional : std::false_type {};
+template<typename T>
+struct IsOptional<std::optional<T>> : std::true_type {};
+
+// The text-format pointer libpq gets for one parameter: nullptr is SQL NULL.
+template<typename T>
+const char* paramValue(const T& arg) noexcept
+{
+    if constexpr (IsOptional<T>::value) {
+        return arg.has_value() ? paramValue(*arg) : nullptr;
+    } else {
+        return arg.c_str();
+    }
+}
+
+// A text parameter is sent as a NUL-terminated C string, so everything after
+// an embedded NUL would be silently dropped (CWE-158): such a value is refused
+// instead (REQ-PGPP-074). Detected for any argument that knows its size.
+template<typename T>
+bool paramHasEmbeddedNul(const T& arg) noexcept
+{
+    if constexpr (IsOptional<T>::value) {
+        return arg.has_value() && paramHasEmbeddedNul(*arg);
+    } else if constexpr (requires { arg.size(); }) {
+        return std::char_traits<char>::length(arg.c_str()) != static_cast<size_t>(arg.size());
+    } else {
+        return false;
+    }
+}
+
 // Column types whose binary encoding is the text itself (client encoding, no terminator).
 inline bool isTextualType(Oid type) noexcept
 {
@@ -185,8 +225,8 @@ inline bool isTextualType(Oid type) noexcept
 inline uint64_t loadBigEndian(std::string_view bytes) noexcept
 {
     uint64_t value = 0;
-    for (const unsigned char byte : bytes) {
-        value = (value << 8) | byte;
+    for (const char byte : bytes) {
+        value = (value << 8) | static_cast<unsigned char>(byte);
     }
     return value;
 }
@@ -259,7 +299,7 @@ Converted<T> decodeFloating(Oid type, std::string_view bytes) noexcept
 
         const double value = std::bit_cast<double>(loadBigEndian(bytes));
         if constexpr (std::is_same_v<T, float>) {
-            if (std::isfinite(value) && std::fabs(value) > FLT_MAX) {
+            if (std::isfinite(value) && std::fabs(value) > static_cast<double>(FLT_MAX)) {
                 return std::unexpected(ConversionError::OutOfRange);
             }
         }
@@ -278,7 +318,16 @@ Converted<T> decodeFloating(Oid type, std::string_view bytes) noexcept
 template<typename T>
 Converted<T> decodeBinary(Oid type, std::string_view bytes)
 {
-    if constexpr (std::is_same_v<T, std::string>) {
+    if constexpr (IsOptional<T>::value) {
+        // std::optional<U>: a non-NULL cell decodes as U (NULL never gets here,
+        // see fillPQValue).
+        auto inner = decodeBinary<typename T::value_type>(type, bytes);
+        if (!inner.has_value()) {
+            return std::unexpected(inner.error());
+        } else {
+            return T(std::move(*inner));
+        }
+    } else if constexpr (std::is_same_v<T, std::string>) {
         if (!isTextualType(type)) {
             // int, timestamp, uuid, numeric, ...: cast to ::text in the SQL instead.
             return std::unexpected(ConversionError::TypeMismatch);
@@ -314,12 +363,16 @@ Converted<T> decodeBinary(Oid type, std::string_view bytes)
     }
 }
 
-// NULL leaves the default value. Returns false if the cell could not be decoded.
-// `type` is the column's OID, looked up once per result rather than per cell.
+// NULL leaves the default value (nullopt for a std::optional column,
+// REQ-PGPP-008/075). Returns false if the cell could not be decoded. `type` is
+// the column's OID, looked up once per result rather than per cell.
 template<typename T>
 bool fillPQValue(PGresult* result, int row, int col, Oid type, T& value)
 {
     if (PQgetisnull(result, row, col)) {
+        if constexpr (IsOptional<T>::value) {
+            value.reset();
+        }
         return true;
     }
 
@@ -336,9 +389,12 @@ bool fillPQValue(PGresult* result, int row, int col, Oid type, T& value)
 
 // Returns false at the first column that fails to decode.
 template<typename... TAs, size_t... Is>
-bool fillTupleFromPQValues(PGresult* result, int row, const Oid* types, std::tuple<TAs...>& tuple, std::index_sequence<Is...>)
+bool fillTupleFromPQValues([[maybe_unused]] PGresult* result, [[maybe_unused]] int row,
+                           [[maybe_unused]] const Oid* types, [[maybe_unused]] std::tuple<TAs...>& tuple,
+                           std::index_sequence<Is...>)
 {
-    return (fillPQValue(result, row, Is, types[Is], std::get<Is>(tuple)) && ...);
+    // For std::tuple<> the pack is empty and every parameter is unused.
+    return (fillPQValue(result, row, static_cast<int>(Is), types[Is], std::get<Is>(tuple)) && ...);
 }
 
 } // namespace Details
@@ -347,14 +403,21 @@ bool fillTupleFromPQValues(PGresult* result, int row, const Oid* types, std::tup
 template<typename... Ts>
 bool PgppConnection::execPrepared(const std::string& statement, const Ts&... args) noexcept
 {
-    constexpr auto size = sizeof...(args);
-    const char* paramValuesArr[] = { args.c_str()..., nullptr };
+    constexpr int size = sizeof...(args);
+    if ((Internal::Details::paramHasEmbeddedNul(args) || ... || false)) [[unlikely]] {
+        logParamError(statement);
+        return false;
+    }
+    const char* paramValuesArr[] = { Internal::Details::paramValue(args)..., nullptr };
     const char** paramValues = size > 0 ? paramValuesArr : nullptr;
 
     PQResultPtr queryResult(PQexecPrepared(m_connection, statement.c_str(), size, paramValues, NULL, NULL, 0));
     if (!queryResult) return false;
 
-    if (auto status = PQresultStatus(queryResult.get()); status != PGRES_COMMAND_OK) [[unlikely]] {
+    // The statement ran: a command (PGRES_COMMAND_OK) or one that returned rows
+    // nobody asked for (PGRES_TUPLES_OK: SELECT, INSERT ... RETURNING), REQ-PGPP-073.
+    if (auto status = PQresultStatus(queryResult.get());
+        status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK) [[unlikely]] {
         logTemplateError(statement, status);
         return false;
     }
@@ -364,8 +427,12 @@ bool PgppConnection::execPrepared(const std::string& statement, const Ts&... arg
 template<typename... Ts, typename... TAs>
 bool PgppConnection::execPrepared(const std::string& statement, std::vector<std::tuple<TAs...>>& result, const Ts&... args) noexcept
 {
-    constexpr auto size = sizeof...(args);
-    const char* paramValuesArr[] = { args.c_str()..., nullptr };
+    constexpr int size = sizeof...(args);
+    if ((Internal::Details::paramHasEmbeddedNul(args) || ... || false)) [[unlikely]] {
+        logParamError(statement);
+        return false;
+    }
+    const char* paramValuesArr[] = { Internal::Details::paramValue(args)..., nullptr };
     const char** paramValues = size > 0 ? paramValuesArr : nullptr;
 
     // Parameters are text (REQ-PGPP-016); results are requested in binary (REQ-PGPP-062).
@@ -379,23 +446,23 @@ bool PgppConnection::execPrepared(const std::string& statement, std::vector<std:
         return false;
     }
 
-    constexpr int columns = sizeof...(TAs);
-    if (PQnfields(queryResult.get()) < columns) [[unlikely]] {
-        logColumnCountError(statement, PQnfields(queryResult.get()), columns);
+    constexpr size_t columns = sizeof...(TAs);
+    if (PQnfields(queryResult.get()) < static_cast<int>(columns)) [[unlikely]] {
+        logColumnCountError(statement, PQnfields(queryResult.get()), static_cast<int>(columns));
         return false;
     }
 
     // std::array, not a C array: `std::tuple<>` makes `columns` 0, and a
     // zero-length C array is ill-formed (MSVC C2466).
     std::array<Oid, columns> types{};
-    for (int col = 0; col < columns; col++) {
-        types[static_cast<size_t>(col)] = PQftype(queryResult.get(), col);
+    for (size_t col = 0; col < columns; col++) {
+        types[col] = PQftype(queryResult.get(), static_cast<int>(col));
     }
 
     const auto initialSize = result.size();
     try {
         const int rows = PQntuples(queryResult.get());
-        result.reserve(initialSize + rows);
+        result.reserve(initialSize + static_cast<size_t>(rows));
         for (int idx = 0; idx < rows; idx++) {
             std::tuple<TAs...> row;
             if (!Internal::Details::fillTupleFromPQValues(queryResult.get(), idx, types.data(), row, std::make_index_sequence<columns>{})) [[unlikely]] {

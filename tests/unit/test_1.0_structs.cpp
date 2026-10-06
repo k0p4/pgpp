@@ -35,7 +35,13 @@ TEST(Structs, PgppConnectionInfoDefaults)
     EXPECT_TRUE(info.host.empty());
     EXPECT_TRUE(info.user.empty());
     EXPECT_TRUE(info.password.empty());
+    EXPECT_TRUE(info.sslmode.empty());        // libpq's default, "prefer"
+    EXPECT_TRUE(info.libpqParams.empty());
     EXPECT_EQ(info.port, 5432);
+    EXPECT_EQ(info.connectTimeoutSeconds, 0);  // libpq's default
+    EXPECT_EQ(info.acquireTimeout, std::chrono::milliseconds(30000));
+    EXPECT_EQ(info.maxQueuedRequests, 0u);     // unbounded
+    EXPECT_FALSE(info.resetSessionAfterRequest);
 }
 
 // ── UT-OID-001: pg:: namespace OID constants match PostgreSQL catalog ───────

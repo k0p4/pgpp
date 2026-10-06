@@ -12,6 +12,8 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <limits>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -183,9 +185,10 @@ TEST(BinaryDecoding, IntegerColumnIntoFloatingPoint)
 
 TEST(BinaryDecoding, DoubleInfinityAndNaN)
 {
-    auto posInf = decodeBinary<double>(pg::FLOAT8, float8Cell(INFINITY));
-    auto negInf = decodeBinary<double>(pg::FLOAT8, float8Cell(-INFINITY));
-    auto nan    = decodeBinary<double>(pg::FLOAT8, float8Cell(NAN));
+    constexpr double inf = std::numeric_limits<double>::infinity();
+    auto posInf = decodeBinary<double>(pg::FLOAT8, float8Cell(inf));
+    auto negInf = decodeBinary<double>(pg::FLOAT8, float8Cell(-inf));
+    auto nan    = decodeBinary<double>(pg::FLOAT8, float8Cell(std::numeric_limits<double>::quiet_NaN()));
     ASSERT_TRUE(posInf.has_value());
     ASSERT_TRUE(negInf.has_value());
     ASSERT_TRUE(nan.has_value());
@@ -195,7 +198,7 @@ TEST(BinaryDecoding, DoubleInfinityAndNaN)
     EXPECT_LT(*negInf, 0.0);
     EXPECT_TRUE(std::isnan(*nan));
     // Infinity is representable as float too, so it is not "out of range".
-    EXPECT_TRUE(std::isinf(decodeBinary<float>(pg::FLOAT8, float8Cell(INFINITY)).value_or(0.0f)));
+    EXPECT_TRUE(std::isinf(decodeBinary<float>(pg::FLOAT8, float8Cell(inf)).value_or(0.0f)));
 }
 
 // ── UT-CONV-018..020: bool, UTF-8, OID catalog ──────────────────────────────
@@ -223,6 +226,45 @@ TEST(BinaryDecoding, TextualTypeSet)
                          pg::DATE, pg::TIME, pg::TIMESTAMP, pg::TIMESTAMPTZ, pg::TIMETZ, pg::NUMERIC}) {
         EXPECT_FALSE(isTextualType(oid)) << oid;
     }
+}
+
+// ── UT-CONV-023: std::optional<T> columns (REQ-PGPP-075) ────────────────────
+
+// A non-NULL cell decodes exactly as T and is wrapped; every decoding error
+// is passed through unchanged. (NULL never reaches the decoder: fillPQValue
+// leaves the optional empty.)
+TEST(BinaryDecoding, OptionalWrapsTheInnerDecoder)
+{
+    EXPECT_EQ(decodeBinary<std::optional<int>>(pg::INT4, int4Cell(42)).value(), std::optional<int>(42));
+    EXPECT_EQ(decodeBinary<std::optional<std::string>>(pg::TEXT, "x").value(), std::optional<std::string>("x"));
+    EXPECT_EQ(decodeBinary<std::optional<bool>>(pg::BOOL, std::string("\x00", 1)).value(), std::optional<bool>(false));
+    EXPECT_DOUBLE_EQ(decodeBinary<std::optional<double>>(pg::FLOAT8, float8Cell(1.5)).value().value(), 1.5);
+
+    EXPECT_EQ(decodeBinary<std::optional<int16_t>>(pg::INT4, int4Cell(40000)).error(), ConversionError::OutOfRange);
+    EXPECT_EQ(decodeBinary<std::optional<int>>(pg::TEXT, "42").error(),               ConversionError::TypeMismatch);
+    EXPECT_EQ(decodeBinary<std::optional<int>>(pg::INT4, std::string("\x00", 1)).error(), ConversionError::Malformed);
+}
+
+// ── UT-CONV-024: parameters (REQ-PGPP-074/075) ──────────────────────────────
+
+TEST(BinaryDecoding, ParameterPointersAndEmbeddedNul)
+{
+    const std::string plain("abc");
+    const std::optional<std::string> absent;
+    const std::optional<std::string> present("xyz");
+    EXPECT_STREQ(paramValue(plain), "abc");
+    EXPECT_EQ(paramValue(absent), nullptr);        // SQL NULL
+    EXPECT_STREQ(paramValue(present), "xyz");
+
+    std::string withNul("a");
+    withNul.push_back('\0');
+    withNul += "b";
+    EXPECT_FALSE(paramHasEmbeddedNul(plain));
+    EXPECT_FALSE(paramHasEmbeddedNul(absent));
+    EXPECT_FALSE(paramHasEmbeddedNul(present));
+    EXPECT_FALSE(paramHasEmbeddedNul(std::string()));
+    EXPECT_TRUE(paramHasEmbeddedNul(withNul));
+    EXPECT_TRUE(paramHasEmbeddedNul(std::optional<std::string>(withNul)));
 }
 
 // ── UT-CONV-022: zero result columns ────────────────────────────────────────

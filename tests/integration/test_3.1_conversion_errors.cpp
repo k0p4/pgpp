@@ -147,6 +147,8 @@ TEST_F(PgppIntegrationTest, ConversionFailureCoQueryResumes)
     std::optional<bool> queryOk;
     size_t              rowCount = 1;
 
+    // The closure is a named local that outlives the coroutine (the test waits for it); see usage.md.
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-capturing-lambda-coroutines)
     auto coro = [&]() -> FireAndForget {
         auto [ok, rows] = co_await coQuery<std::tuple<int>>(pool, "conv_coro");
         queryOk  = ok;
@@ -175,6 +177,8 @@ TEST(ConversionFailure, SingleWorkerKeepsServing)
     std::optional<bool> goodOk;
     int goodValue = 0;
 
+    // The closure is a named local that outlives the coroutine (the test waits for it); see usage.md.
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-capturing-lambda-coroutines)
     auto coro = [&]() -> FireAndForget {
         for (int i = 0; i < 3; ++i) {
             auto [ok, rows] = co_await coQuery<std::tuple<int>>(pool, "conv_many");
