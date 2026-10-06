@@ -4,8 +4,8 @@
 
 | Tool | Notes |
 |------|-------|
-| C++20 compiler | MSVC 2022, GCC 11+, Clang 14+ |
-| CMake 3.16+ | |
+| C++23 compiler | Needs `std::expected`: MSVC 2022 17.3+, GCC 12+, Clang 16+ with libc++, Clang 19+ with libstdc++ (Clang 18 + libstdc++ hides `<expected>`) |
+| CMake 3.20+ | |
 | vcpkg | Set `VCPKG_ROOT` environment variable |
 | Python 3.6+ | Optional — for the build script |
 | Docker | Required for integration tests only |

@@ -21,6 +21,10 @@
 
 // If PGPP_USE_ALOG is defined, uses alog. Otherwise no-op (zero overhead).
 // Define PGPP_USE_STDERR for simple stderr output without alog.
+//
+// Every sink is used from noexcept functions, including the catch handlers
+// that report an allocation failure (REQ-PGPP-061), so a sink must not throw.
+// The stderr sink below guarantees that; alog's sink is required to.
 
 #if defined(PGPP_USE_ALOG)
     #include <alog/all.h>
@@ -33,8 +37,21 @@
     #include <iostream>
     #define PGPP_DEFINE_LOG_MODULE(name)
     struct PgppStderrLog {
-        ~PgppStderrLog() { std::cerr << std::endl; }
-        template<typename T> PgppStderrLog& operator<<(const T& v) { std::cerr << v; return *this; }
+        ~PgppStderrLog() noexcept
+        {
+            try {
+                std::cerr << std::endl;
+            } catch (...) {
+            }
+        }
+        template<typename T> PgppStderrLog& operator<<(const T& v) noexcept
+        {
+            try {
+                std::cerr << v;
+            } catch (...) {
+            }
+            return *this;
+        }
     };
     #define PGPP_LOGV PgppStderrLog()
     #define PGPP_LOGD PgppStderrLog()

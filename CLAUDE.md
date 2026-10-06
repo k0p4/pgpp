@@ -1,8 +1,8 @@
-# pgpp - C++20 PostgreSQL Connection Pool
+# pgpp - C++23 PostgreSQL Connection Pool
 
 ## Project Identity
 
-pgpp is a C++20 thread-safe PostgreSQL connection pool library built on libpq. It provides
+pgpp is a C++23 thread-safe PostgreSQL connection pool library built on libpq. It provides
 synchronous, future-based, callback-based, and coroutine-based APIs for prepared statements,
 raw SQL, and transactions. Designed for consumption via CMake FetchContent.
 
@@ -11,7 +11,7 @@ raw SQL, and transactions. Designed for consumption via CMake FetchContent.
 
 ## Quick Reference (Standalone Development)
 
-Prerequisites: C++20 compiler, CMake 3.16+, `VCPKG_ROOT` environment variable.
+Prerequisites: C++23 compiler, CMake 3.20+, `VCPKG_ROOT` environment variable.
 
 ```bash
 python build_and_test.py              # full pipeline: configure + build + test
@@ -67,7 +67,7 @@ pgpp/
 
 ## Build System
 
-- **CMake 3.16+**, C++20 required
+- **CMake 3.20+**, C++23 required (`std::expected`)
 - Static library target: `pgpp`
 - Public dependency: `PostgreSQL::PostgreSQL` (via `find_package`)
 - Optional: `alog` logging library (auto-detected, enables `PGPP_USE_ALOG`)
@@ -112,15 +112,15 @@ When changing API, tests, or build system — update the corresponding docs:
 
 - **Logging:** Compile-time selectable via `PGPP_USE_ALOG` or `PGPP_USE_STDERR`; defaults to no-op
 - **Threading:** Pool is thread-safe (mutex + condition_variable + atomics). Connection is NOT thread-safe.
-- **Type conversions:** string, int, int16_t, int64_t, uint32_t, double, float, bool. NULL becomes C++ default value.
+- **Result decoding:** results are fetched in binary format (REQ-PGPP-062) and decoded by column OID into string / any integral type / double / float / bool, range-checked. No text parsing. Non-text columns read into `std::string` need `::text` in SQL; `numeric` needs `::int8`/`::float8`. NULL becomes the C++ default value.
 - **OIDs:** Use `pg::` namespace constants (e.g., `pg::TEXT`, `pg::INT4`), not legacy macros
-- **Parameters:** All query parameters are passed as text-format strings (`.c_str()`)
-- **Error handling:** Auto-reconnect via `PQreset` on connection loss. Futures return `nullopt` on shutdown.
+- **Parameters:** All query parameters are passed as text-format strings (`.c_str()`); only results are binary
+- **Error handling:** No exception leaves the library (REQ-PGPP-061): every public function is `noexcept`, everything that can throw inside (allocation, argument copies, thread/mutex errors, user callbacks) is caught and turned into the failure value (`false`, `nullopt`, an already-resolved or invalid future, an immediately-completing awaitable). Auto-reconnect via `PQreset` on connection loss. Futures return `nullopt` on shutdown.
 
 ## Testing
 
 - **Framework:** GoogleTest v1.14.0 (fetched via FetchContent)
-- **Unit tests:** Type conversions, connection string building, pool state machine (no database needed)
+- **Unit tests:** Binary result decoding, connection string building, pool state machine, no-exceptions guarantees (no database needed)
 - **Integration tests:** Full CRUD, pool concurrency, transactions, coroutines (require PostgreSQL)
 - **Docker fixture:** Integration tests auto-manage a PostgreSQL container via Docker CLI
   - Set `PGPP_SKIP_DOCKER=1` to skip Docker management (e.g. when PostgreSQL is already running)

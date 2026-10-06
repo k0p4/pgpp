@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.20)
 project(pgpp LANGUAGES CXX)
 
 set(PostgreSQL_ADDITIONAL_VERSIONS "17" "16" "15" "14" "13")
@@ -13,8 +13,9 @@ add_library(pgpp STATIC
     src/pgpp_connection.cpp
 )
 
-set_property(TARGET pgpp PROPERTY CXX_STANDARD 20)
-set_property(TARGET pgpp PROPERTY CXX_STANDARD_REQUIRED ON)
+# PUBLIC: the headers use std::expected, so every consumer of the target
+# (FetchContent included) inherits C++23 instead of having to set it by hand.
+target_compile_features(pgpp PUBLIC cxx_std_23)
 
 target_include_directories(pgpp
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include

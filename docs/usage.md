@@ -46,6 +46,11 @@ C++20 coroutine support via `<pgpp/pgpp_coroutines.h>`.
 
 `FireAndForget` is a minimal coroutine return type — starts immediately, self-destructs on completion.
 
+A coroutine lambda's closure must outlive the coroutine: keep the lambda in a named variable
+until the coroutine has finished, or write a plain coroutine function (parameters are copied into
+the frame). Invoking a temporary lambda, `[&]() -> FireAndForget { ... }();`, destroys the closure
+at the end of the statement while the suspended frame still refers to its captures.
+
 ```cpp
 #include <pgpp/pgpp_coroutines.h>
 
@@ -132,16 +137,37 @@ For simple stderr output without alog:
 target_compile_definitions(pgpp PRIVATE PGPP_USE_STDERR)
 ```
 
+## Error Handling
+
+pgpp never throws. Every public function is `noexcept` and reports failure through its return
+value: `false`, `std::nullopt` (shutdown, no connection, or the request could not be built), an
+already-resolved future, or an awaitable that completes at once. Check `future.valid()` only if
+you want to distinguish the extreme case where not even the result promise could be allocated;
+the sync wrappers already treat that as `false`. A callback that throws is caught: on a worker
+thread it is logged, on the calling thread it is dropped.
+
 ## Type Mapping
 
-| PostgreSQL | C++ type | OID constant |
-|---|---|---|
-| VARCHAR, TEXT | `std::string` | `pg::VARCHAR`, `pg::TEXT` |
-| INTEGER | `int` | `pg::INT4` |
-| BIGINT | `int64_t` | `pg::INT8` |
-| SMALLINT | `int16_t` | `pg::INT2` |
-| REAL | `float` | `pg::FLOAT4` |
-| DOUBLE PRECISION | `double` | `pg::FLOAT8` |
-| BOOLEAN | `bool` | — |
+Results arrive in PostgreSQL's binary format and are decoded straight into the tuple; nothing is
+parsed from text. The column type must match the C++ type:
 
-NULL values are left at their C++ default (empty string, 0, false).
+| PostgreSQL column | C++ type | OID constant (for parameters) |
+|---|---|---|
+| TEXT, VARCHAR, CHAR(n), NAME, JSON, JSONB, XML, untyped literal | `std::string` | `pg::TEXT`, `pg::VARCHAR`, `pg::BPCHAR`, ... |
+| SMALLINT, INTEGER, BIGINT, OID | `int16_t`, `int`, `int64_t`, `uint32_t` (any integral type; widened or range-checked) | `pg::INT2`, `pg::INT4`, `pg::INT8`, `pg::OID` |
+| REAL, DOUBLE PRECISION (and the integer types) | `float`, `double` | `pg::FLOAT4`, `pg::FLOAT8` |
+| BOOLEAN | `bool` | `pg::BOOL` |
+
+Anything else needs a cast in the SQL:
+
+```cpp
+// timestamp / uuid / numeric into std::string: cast to text
+db.prepareStatement({"created", "SELECT created_at::text FROM account WHERE id = $1", {pg::INT4}});
+// numeric into a number: cast to a binary-decodable type
+db.prepareStatement({"balance", "SELECT balance::float8 FROM wallet WHERE id = $1", {pg::INT4}});
+```
+
+A value that does not fit the C++ type fails the query (`false`, no rows) rather than wrapping:
+`COUNT(*)` above `INT_MAX` read into `int`, 40000 read into `int16_t`, -1 read into `uint32_t`.
+Parameters are still passed as text strings. NULL values are left at their C++ default
+(empty string, 0, false).
