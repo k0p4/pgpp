@@ -12,6 +12,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -184,9 +185,10 @@ TEST(BinaryDecoding, IntegerColumnIntoFloatingPoint)
 
 TEST(BinaryDecoding, DoubleInfinityAndNaN)
 {
-    auto posInf = decodeBinary<double>(pg::FLOAT8, float8Cell(INFINITY));
-    auto negInf = decodeBinary<double>(pg::FLOAT8, float8Cell(-INFINITY));
-    auto nan    = decodeBinary<double>(pg::FLOAT8, float8Cell(NAN));
+    constexpr double inf = std::numeric_limits<double>::infinity();
+    auto posInf = decodeBinary<double>(pg::FLOAT8, float8Cell(inf));
+    auto negInf = decodeBinary<double>(pg::FLOAT8, float8Cell(-inf));
+    auto nan    = decodeBinary<double>(pg::FLOAT8, float8Cell(std::numeric_limits<double>::quiet_NaN()));
     ASSERT_TRUE(posInf.has_value());
     ASSERT_TRUE(negInf.has_value());
     ASSERT_TRUE(nan.has_value());
@@ -196,7 +198,7 @@ TEST(BinaryDecoding, DoubleInfinityAndNaN)
     EXPECT_LT(*negInf, 0.0);
     EXPECT_TRUE(std::isnan(*nan));
     // Infinity is representable as float too, so it is not "out of range".
-    EXPECT_TRUE(std::isinf(decodeBinary<float>(pg::FLOAT8, float8Cell(INFINITY)).value_or(0.0f)));
+    EXPECT_TRUE(std::isinf(decodeBinary<float>(pg::FLOAT8, float8Cell(inf)).value_or(0.0f)));
 }
 
 // ── UT-CONV-018..020: bool, UTF-8, OID catalog ──────────────────────────────

@@ -313,6 +313,8 @@ TEST_F(PgppIntegrationTest, CoroutineThrowAfterAwait)
     std::atomic<bool> preThrow  { false };
     std::atomic<bool> postThrow { false };
 
+    // The closure is a named local that outlives the coroutine (the test waits for it); see usage.md.
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-capturing-lambda-coroutines)
     auto coro = [&]() -> FireAndForget {
         // Succeed first...
         co_await coExec(pool, "coro_throw", std::string("pre_throw"));
@@ -358,6 +360,8 @@ TEST(CoroutineStress, ShutdownWhileSuspended)
     std::atomic<bool>   done { false };
     std::optional<bool> coResult;
 
+    // The closure is a named local that outlives the coroutine (the test waits for it); see usage.md.
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-capturing-lambda-coroutines)
     auto coro = [&]() -> FireAndForget {
         coResult = co_await coExec(*pool, "no_such_stmt", std::string("x"));
         done.store(true);

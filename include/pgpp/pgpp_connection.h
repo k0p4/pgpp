@@ -299,7 +299,7 @@ Converted<T> decodeFloating(Oid type, std::string_view bytes) noexcept
 
         const double value = std::bit_cast<double>(loadBigEndian(bytes));
         if constexpr (std::is_same_v<T, float>) {
-            if (std::isfinite(value) && std::fabs(value) > FLT_MAX) {
+            if (std::isfinite(value) && std::fabs(value) > static_cast<double>(FLT_MAX)) {
                 return std::unexpected(ConversionError::OutOfRange);
             }
         }

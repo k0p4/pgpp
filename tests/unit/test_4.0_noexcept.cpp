@@ -27,19 +27,20 @@ namespace {
 struct TerminateDiagnostics {
     TerminateDiagnostics()
     {
-        std::set_terminate([] {
-            std::fputs("[pgpp unit tests] std::terminate called", stderr);
+        // Best-effort diagnostics on the way to abort(): a failed write changes nothing.
+        (void)std::set_terminate([] {
+            (void)std::fputs("[pgpp unit tests] std::terminate called", stderr);
             try {
                 if (auto current = std::current_exception()) {
                     std::rethrow_exception(current);
                 }
             } catch (const std::exception& e) {
-                std::fprintf(stderr, " with exception: %s", e.what());
+                (void)std::fprintf(stderr, " with exception: %s", e.what());
             } catch (...) {
-                std::fputs(" with a non-std exception", stderr);
+                (void)std::fputs(" with a non-std exception", stderr);
             }
-            std::fputc('\n', stderr);
-            std::fflush(stderr);
+            (void)std::fputc('\n', stderr);
+            (void)std::fflush(stderr);
             std::abort();
         });
     }
@@ -58,7 +59,7 @@ struct ThrowingArg {
 struct ThrowingWork {
     ThrowingWork() = default;
     ThrowingWork(const ThrowingWork&) { throw std::runtime_error("ThrowingWork copy"); }
-    ThrowingWork(ThrowingWork&&) { throw std::runtime_error("ThrowingWork move"); }
+    ThrowingWork(ThrowingWork&&) { throw std::runtime_error("ThrowingWork move"); }   // NOLINT(performance-noexcept-move-constructor): the point is that it throws
     void operator()(PgppConnection&) const {}
 };
 
@@ -191,6 +192,8 @@ TEST(NoExceptions, CoroutineArgumentCopyFailureCompletesWithNullopt)
 
     // Both awaitables must complete immediately with nullopt instead of
     // throwing into the coroutine (which FireAndForget would only log).
+    // The closure is a named local that outlives the coroutine (the test waits for it); see usage.md.
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-capturing-lambda-coroutines)
     auto run = [&]() -> FireAndForget {
         execResult = co_await coExec(pool, "stmt", arg);
         auto [ok, rows] = co_await coQuery<std::tuple<int>>(pool, "stmt", arg);

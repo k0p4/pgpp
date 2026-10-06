@@ -484,9 +484,10 @@ TEST(PoolReentrancy, ConcurrentInitializeShutdown)
 
 namespace {
 
-FireAndForget stormCoroutine(PgppPool& db, std::shared_ptr<std::atomic<int>> completed)
+// A pointer, not a reference: the pool outlives every coroutine in the storm.
+FireAndForget stormCoroutine(PgppPool* db, std::shared_ptr<std::atomic<int>> completed)
 {
-    co_await coExec(db, "r_one");
+    co_await coExec(*db, "r_one");
     completed->fetch_add(1);
 }
 
@@ -563,7 +564,7 @@ TEST(PoolReentrancy, MixedApiStorm)
                         }
                         default:
                             issued->fetch_add(1);
-                            stormCoroutine(*pool, completed);
+                            stormCoroutine(pool, completed);
                             break;
                         }
                     }

@@ -28,6 +28,8 @@ TEST_F(PgppIntegrationTest, CoExecInsert)
     std::atomic<bool> done { false };
     std::optional<bool> result;
 
+    // The closure is a named local that outlives the coroutine (the test waits for it); see usage.md.
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-capturing-lambda-coroutines)
     auto coro = [&]() -> FireAndForget {
         result = co_await coExec(pool, "coro_ins", std::string("coro_user"), std::string("42"));
         done.store(true);
@@ -50,6 +52,8 @@ TEST_F(PgppIntegrationTest, CoQueryReturnsRows)
     std::optional<bool> queryOk;
     std::vector<std::tuple<std::string, int>> queryRows;
 
+    // The closure is a named local that outlives the coroutine (the test waits for it); see usage.md.
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-capturing-lambda-coroutines)
     auto coro = [&]() -> FireAndForget {
         using Row = std::tuple<std::string, int>;
         auto [ok, rows] = co_await coQuery<Row>(pool, "coro_sel", std::string("coro_bob"));
@@ -73,10 +77,12 @@ TEST_F(PgppIntegrationTest, CoQueryReturnsRows)
 // (An immediately-invoked *temporary* lambda would be destroyed at the end
 // of the full expression while the frame still references its captures,
 // which ThreadSanitizer reported as a use of dead stack memory.)
-static FireAndForget insertAndCount(PgppPool& pool, std::string name, std::atomic<int>& completionCount)
+// Pointers, not references: the pool and the counter outlive the coroutine,
+// and a pointer makes that an explicit choice rather than a dangling risk.
+static FireAndForget insertAndCount(PgppPool* pool, std::string name, std::atomic<int>* completionCount)
 {
-    co_await coExec(pool, "coro_faf", name);
-    completionCount.fetch_add(1);
+    co_await coExec(*pool, "coro_faf", name);
+    completionCount->fetch_add(1);
 }
 
 TEST_F(PgppIntegrationTest, FireAndForgetSelfDestructs)
@@ -87,7 +93,7 @@ TEST_F(PgppIntegrationTest, FireAndForgetSelfDestructs)
 
     // Launch multiple fire-and-forget coroutines
     for (int i = 0; i < 10; ++i) {
-        insertAndCount(pool, "faf_" + std::to_string(i), completionCount);
+        insertAndCount(&pool, "faf_" + std::to_string(i), &completionCount);
     }
 
     EXPECT_TRUE(waitFor([&] { return completionCount.load() == 10; }));
@@ -105,6 +111,8 @@ TEST_F(PgppIntegrationTest, CoExecPreparedBackwardCompat)
     std::optional<bool> execResult;
     std::vector<std::tuple<std::string>> queryRows;
 
+    // The closure is a named local that outlives the coroutine (the test waits for it); see usage.md.
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-capturing-lambda-coroutines)
     auto coro = [&]() -> FireAndForget {
         // Test coExecPrepared alias
         execResult = co_await coExecPrepared(pool, "compat_ins", std::string("compat_user"));
@@ -132,6 +140,8 @@ TEST_F(PgppIntegrationTest, CoExecFailingQuery)
     std::atomic<bool> done { false };
     std::optional<bool> result;
 
+    // The closure is a named local that outlives the coroutine (the test waits for it); see usage.md.
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-capturing-lambda-coroutines)
     auto coro = [&]() -> FireAndForget {
         result = co_await coExec(pool, "nonexistent_coro_stmt", std::string("arg"));
         done.store(true);
@@ -161,6 +171,8 @@ TEST(CoroutineShutdown, CoAwaitOnShutdownPool)
     std::atomic<bool> done { false };
     std::optional<bool> result;
 
+    // The closure is a named local that outlives the coroutine (the test waits for it); see usage.md.
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-capturing-lambda-coroutines)
     auto coro = [&]() -> FireAndForget {
         result = co_await coExec(pool, "coro_shutdown");
         done.store(true);
