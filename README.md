@@ -6,7 +6,7 @@ Convenient C++23 wrapper over libpq with connection pooling, prepared statements
 
 ## Features
 
-- **Thread-per-connection pool** — each worker owns its connection exclusively, no sharing
+- **Standard pool design** — a free-list of connections handed out as RAII leases, plus a small executor for the async APIs; the sync API runs on your thread with no hop
 - **Multiple APIs** — sync, future, callback, C++20 coroutines
 - **Auto-reconnect** — dead connections are restored transparently
 - **Prepared statements** — registered once, available on all connections

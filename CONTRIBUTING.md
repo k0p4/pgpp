@@ -119,6 +119,19 @@ This will:
 3. Run all integration tests
 4. Stop and remove the container
 
+#### ThreadSanitizer
+
+CI runs the whole suite under ThreadSanitizer (job `ThreadSanitizer`). Locally:
+
+```bash
+cmake -S . -B build/tsan -DPGPP_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Debug \
+      -DCMAKE_CXX_FLAGS=-fsanitize=thread -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread
+cmake --build build/tsan -j
+TSAN_OPTIONS="halt_on_error=1" setarch -R ./build/tsan/tests/pgpp_integration_tests
+```
+
+`setarch -R` (or `sysctl vm.mmap_rnd_bits=28`) is needed on recent Linux kernels.
+
 #### Manual PostgreSQL
 
 If you prefer to use your own PostgreSQL instance, set `PGPP_SKIP_DOCKER=1` and configure the connection via environment variables:

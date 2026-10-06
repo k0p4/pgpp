@@ -107,7 +107,7 @@ TEST(PoolState, EnqueueRawOnUninitializedPool)
 
     auto request = std::make_unique<PgppRequest>();
     bool called = false;
-    request->task = [&called](PgppConnection*) { called = true; };
+    request->task = [&called](PgppPool::Lease) { called = true; };
 
     bool enqueued = pool.enqueueRaw(std::move(request));
     EXPECT_FALSE(enqueued);  // m_initialized is false — must reject

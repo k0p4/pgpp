@@ -83,6 +83,8 @@ TEST(NoExceptions, PublicApiIsNoexcept)
     static_assert(noexcept(pool.execRawAsync(s)));
     static_assert(noexcept(pool.transaction([](PgppConnection&) {})));
     static_assert(noexcept(pool.transaction([](PgppConnection&) { return false; })));
+    static_assert(noexcept(pool.transactionSync([](PgppConnection&) { return false; })));
+    static_assert(noexcept(pool.acquire()));
     static_assert(noexcept(pool.queuedRequests()));
 
     PgppConnection conn;

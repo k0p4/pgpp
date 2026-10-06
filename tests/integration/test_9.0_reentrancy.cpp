@@ -234,7 +234,11 @@ TEST(PoolReentrancy, PoolCallInsideWorkIsIndependent)
     EXPECT_FINISHED(outcome, "IT-REENTRY-003");
 }
 
-// ── IT-REENTRY-004: transaction() from a callback, pool of one ──────────────
+// ── IT-REENTRY-004: a transaction from a callback, pool of one ──────────────
+//
+// transactionSync runs on the calling thread with its own lease, so it works
+// from a callback even when the executor has a single thread. (Blocking on
+// transaction().get() from a callback would wait for that same thread.)
 
 TEST(PoolReentrancy, TransactionFromCallbackCommits)
 {
@@ -252,13 +256,12 @@ TEST(PoolReentrancy, TransactionFromCallbackCommits)
         auto inner = std::make_shared<std::promise<bool>>();
         auto innerFuture = inner->get_future();
         pool->exec("r_one", [pool, inner](std::optional<bool>) {
-            auto f = pool->transaction([](PgppConnection& conn) {
+            inner->set_value(pool->transactionSync([](PgppConnection& conn) {
                 return conn.execRaw("INSERT INTO pgpp_reentry VALUES ('from_callback')");
-            });
-            inner->set_value(f.valid() && f.get().value_or(false));
+            }));
         });
         if (innerFuture.wait_for(5s) != std::future_status::ready) {
-            return "transaction() inside the callback never resolved (deadlock)";
+            return "transactionSync inside the callback never returned (deadlock)";
         }
         if (!innerFuture.get()) {
             return "transaction() inside the callback did not commit";

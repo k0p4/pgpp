@@ -56,7 +56,7 @@ Internal request envelope for the worker queue.
 
 | Field | Type | Description |
 |---|---|---|
-| `task` | `std::function<void(PgppConnection*)>` | Work function executed on a worker thread. Receives `nullptr` if the connection is unavailable. |
+| `task` | `std::function<void(PgppPool::Lease)>` | Work function executed on an executor thread with a leased connection. Receives an empty lease if the pool is shutting down or the connection could not be restored. The task returns the lease (`release()`) before completing its future/callback/coroutine (REQ-PGPP-069). |
 
 ---
 
@@ -189,7 +189,9 @@ Single-connection wrapper around a `PGconn*`. NOT thread-safe.
 
 ## 5. PgppPool
 
-Thread-safe connection pool. One worker thread per connection.
+Thread-safe connection pool built from two standard parts: a free-list of connections handed
+out as RAII leases, and an executor (a fixed set of threads over one queue) for the asynchronous
+APIs. No thread owns a connection; whoever holds a lease uses it on their own thread.
 
 ### 5.1 Lifecycle
 
@@ -197,77 +199,92 @@ Thread-safe connection pool. One worker thread per connection.
 |---|---|---|
 | Constructor | `PgppPool()` | Sets `m_poolSize` to `hardware_concurrency()` (falls back to 16 if 0) |
 | Destructor | `~PgppPool()` | Calls `shutdown()` |
-| `initialize` | `bool initialize(const PgppConnectionInfo&, size_t poolSize=0)` | Builds connection string, creates connections, prepares registered statements, starts worker threads. If `poolSize > 0`, overrides the default. |
-| `shutdown` | `void shutdown()` | Stops workers, drains pending requests (delivers `nullptr`), closes connections |
+| `initialize` | `bool initialize(const PgppConnectionInfo&, size_t poolSize=0)` | Builds the connection string, opens `poolSize` connections, prepares the registered statements on each, starts `poolSize` executor threads. If `poolSize > 0`, overrides the default. |
+| `shutdown` | `void shutdown()` | Stops accepting work, lets the executor drain pending requests (each completes with `nullopt`), joins the executor threads, waits for outstanding leases, closes the connections. From an executor thread (inside a callback, transaction work or a resumed coroutine): stops and returns without waiting (REQ-PGPP-070). |
 | `isInitialized` | `bool isInitialized() const noexcept` | Atomic check |
 
 **Requirements:**
 
 - **REQ-PGPP-019:** `initialize` must be idempotent -- second call returns `true` without reinitializing.
-- **REQ-PGPP-020:** `shutdown` must be safe to call multiple times (atomic guard on `m_initialized`).
-- **REQ-PGPP-021:** `shutdown` must drain all pending requests, invoking each task with `nullptr` so that futures receive `std::nullopt`.
-- **REQ-PGPP-022:** Pending requests are drained outside the queue lock to avoid deadlock when tasks call `enqueueRaw` (e.g., coroutine resumption).
-- **REQ-PGPP-060:** `stopWorkerThreads` must set `m_shuttingDown` while holding `m_queueMutex` and only then notify `m_requestQueued`. Workers test the flag inside their wait predicate; flipping it outside the mutex can land between that test and the actual block, the notification is lost, and `join()` never returns. `shutdown()` must never hang, however soon after `initialize()` it is called.
+- **REQ-PGPP-020:** `shutdown` must be safe to call multiple times.
+- **REQ-PGPP-021:** `shutdown` must drain all pending requests: each task runs with an empty lease so that futures receive `std::nullopt`, callbacks fire with `nullopt`, coroutines resume with `nullopt`. The executor threads drain the queue themselves after being told to stop, so a `shutdown()` that cannot join (REQ-PGPP-070) still resolves everything pending.
+- **REQ-PGPP-022:** *Retired.* Tasks are never run under a lock (they run on executor threads that hold no pool lock), so drain-time re-entry into `enqueueRaw` cannot deadlock; it is refused because the pool is no longer initialized.
 - **REQ-PGPP-023:** Destructor must call `shutdown()`.
 - **REQ-PGPP-024:** Copy construction and copy assignment are deleted.
+- **REQ-PGPP-060:** `shutdown()` must never hang, however soon after `initialize()` it is called. Every wait in the pool (`acquire`, the executor's wait for a task, the wait for leases) has the stop flag in its predicate, and every flag is set under the mutex its waiters use, so no wake-up can be lost.
+- **REQ-PGPP-070:** A thread cannot join itself. `shutdown()` called on an executor thread marks the pool uninitialized (new requests are refused), sets the stop flags, wakes everyone and returns at once. The executor threads drain the queue (REQ-PGPP-021) and exit on their own; a leased connection is closed when its lease is returned; the next `shutdown()` or `initialize()` from a non-executor thread joins the threads and closes what is left. `shutdown()` from a non-executor thread is synchronous: when it returns, no executor thread runs, every pending request is resolved, every lease has been returned and every connection is closed. Destroying the pool from an executor thread is forbidden (the destructor cannot wait for the thread it runs on).
+- **REQ-PGPP-071:** `initialize()` and `shutdown()` from non-executor threads are serialised by `m_lifecycleMutex`; two threads calling them concurrently leave the pool either fully initialized with exactly `poolSize` connections or fully shut down, never a mixture. Executor threads never take this mutex (a `shutdown()` that is joining them may hold it): on an executor thread `initialize()` reports the current state and `shutdown()` follows REQ-PGPP-070.
 
 ### 5.2 Statement Management
 
 | Method | Signature | Description |
 |---|---|---|
-| `prepareStatement` | `void prepareStatement(const Statement&)` | Registers a statement. If workers are running, increments `m_stmtVersion` and wakes all workers to re-prepare. If workers are not running (pre-initialize), prepares on existing connections directly. |
+| `prepareStatement` | `void prepareStatement(const Statement&)` | Appends the statement to the registered list. Nothing else: every connection catches up on its next acquisition. |
 
 **Requirements:**
 
 - **REQ-PGPP-025:** Statements registered before `initialize` are prepared during connection creation.
-- **REQ-PGPP-026:** Statements registered after `initialize` trigger lazy re-preparation on all worker threads via the `m_stmtVersion` atomic.
-- **REQ-PGPP-059:** Each worker starts from the statement version captured by `startWorkerThreads` *before* the thread is created (passed as an argument to `workerLoop`), not from a load in the thread body. A `prepareStatement` call that lands between thread creation and the worker's first instruction therefore still shows up as a version mismatch and is prepared before the worker serves its first request. A statement registered immediately after `initialize()` returns must be usable by the very next `exec`/`query`.
+- **REQ-PGPP-026:** Each connection remembers how many statements of the list it has prepared. On every acquisition (REQ-PGPP-067) it prepares the statements registered since, and only those, before the lease is handed out. A statement registered immediately after `initialize()` returns is therefore usable by the very next request, and a statement is never prepared twice on a connection (no `already exists` errors).
 - **REQ-PGPP-027:** Statement list is protected by `m_stmtMutex`.
+- **REQ-PGPP-059:** *Retired.* There are no worker threads to race with `prepareStatement`; REQ-PGPP-026 covers the guarantee.
 
-### 5.3 Synchronous API
+### 5.3 Leases and the Synchronous API
 
 | Method | Signature | Description |
 |---|---|---|
-| `execSync` | `template<Ts...> bool execSync(name, args...)` | Blocks on `execAsync(...).get()`. Returns `true` only if the future contains `true`; `false` if the future is invalid (REQ-PGPP-061). |
-| `querySync` | `template<RowTuple, Ts...> pair<bool, vector<RowTuple>> querySync(name, args...)` | Blocks on `queryAsync(...).get()`. Returns `{false, {}}` if the future contained `nullopt`. |
-| `execRawSync` | `bool execRawSync(const string& sql)` | Blocks on `execRawAsync(...).get()`. |
+| `acquire` | `Lease acquire()` | Takes a free connection for the calling thread, reconnecting and catching up on statements first (REQ-PGPP-026, 042, 043). Waits up to `PgppConnectionInfo::acquireTimeout` (default 30 s; 0 = no limit). Returns an empty lease if none became free in time, the pool is not running, or the reconnect failed. |
+| `Lease` | movable RAII handle | `operator bool`, `get()`, `operator->`, `operator*`, `release()`. Returns the connection to the pool on destruction or `release()`. |
+| `execSync` | `template<Ts...> bool execSync(name, args...)` | `acquire()`, `execPrepared`, release. `false` if no lease. |
+| `querySync` | `template<RowTuple, Ts...> pair<bool, vector<RowTuple>> querySync(name, args...)` | Same with the result overload. `{false, {}}` if no lease. |
+| `execRawSync` | `bool execRawSync(const string& sql)` | Same with `execRaw`. |
+| `transactionSync` | `template<F> bool transactionSync(F&& work)` | `acquire()`, then the transaction protocol of 5.6 on the calling thread; `work` is called in place, not copied. `false` if no lease. |
 
 **Requirements:**
 
-- **REQ-PGPP-028:** Synchronous methods must block on the corresponding async future -- they must not bypass the worker queue.
+- **REQ-PGPP-067:** A connection is used only by the holder of its lease, on the holder's thread. The pool hands out a connection only through `acquire()`; the executor acquires one per task. `acquire()` reconnects a lost connection and prepares missing statements on the caller's thread, outside the pool lock. A caller that already holds a lease (inside `transaction()` work, or with an explicit `acquire()`) and calls the pool again gets a *second* connection, independent of the first, or an empty lease after `acquireTimeout` when none is free; at pool size 1 this is how a nested call fails instead of hanging.
+- **REQ-PGPP-028:** The synchronous methods run on the calling thread with their own lease and never use the executor. They cannot wait for an executor thread, so they are safe from inside a callback, transaction work or a resumed coroutine.
 
 ### 5.4 Future-Based API
 
 | Method | Signature | Return |
 |---|---|---|
-| `execAsync` | `template<Ts...> future<optional<bool>> execAsync(name, args...)` | `nullopt` on shutdown/null conn; `true`/`false` on success/failure |
-| `queryAsync` | `template<RowTuple, Ts...> future<pair<optional<bool>, vector<RowTuple>>> queryAsync(name, args...)` | `{nullopt, {}}` on shutdown/null conn |
-| `execRawAsync` | `future<optional<bool>> execRawAsync(const string& sql)` | `nullopt` on shutdown/null conn |
+| `execAsync` | `template<Ts...> future<optional<bool>> execAsync(name, args...)` | `nullopt` on shutdown/no connection; `true`/`false` on success/failure |
+| `queryAsync` | `template<RowTuple, Ts...> future<pair<optional<bool>, vector<RowTuple>>> queryAsync(name, args...)` | `{nullopt, {}}` on shutdown/no connection |
+| `execRawAsync` | `future<optional<bool>> execRawAsync(const string& sql)` | `nullopt` on shutdown/no connection |
 
 **Requirements:**
 
-- **REQ-PGPP-029:** If `m_shuttingDown` is `true` at call time, the future must be immediately resolved with `nullopt`.
+- **REQ-PGPP-029:** If the pool is not running at call time, the future is resolved with `nullopt` at once (the request is refused by `enqueueRaw`).
 - **REQ-PGPP-029a:** If the request cannot be built or queued (allocation failure, an argument whose copy throws), the future is resolved with `nullopt`; if not even that promise can be allocated, an invalid future is returned (REQ-PGPP-061).
 - **REQ-PGPP-030:** If `enqueueRaw` fails (returns `false`), the promise must be resolved with `nullopt`.
-- **REQ-PGPP-031:** If the worker receives a `nullptr` connection, the promise must be resolved with `nullopt`.
+- **REQ-PGPP-031:** If the task receives an empty lease (drained at shutdown, or the connection could not be restored), the promise must be resolved with `nullopt`.
+- **REQ-PGPP-069:** An executor task returns its lease *before* completing the future, firing the callback or resuming the coroutine. The connection is back in the pool when user code runs, so a sync call from a callback can take it, even at pool size 1. (The exception is `transaction()`, whose lease is held for the whole `work` by definition.)
 
 ### 5.5 Callback-Based API
 
 | Method | Signature | Description |
 |---|---|---|
-| `exec` | `template<Ts...> void exec(name, callback, args...)` | Callback fires on a worker thread with `optional<bool>` |
-| `query` | `template<RowTuple, Ts...> void query(name, callback, args...)` | Callback fires on a worker thread with `optional<bool>` and `vector<RowTuple>` |
+| `exec` | `template<Ts...> void exec(name, callback, args...)` | Callback fires on an executor thread with `optional<bool>` |
+| `query` | `template<RowTuple, Ts...> void query(name, callback, args...)` | Callback fires on an executor thread with `optional<bool>` and `vector<RowTuple>` |
 
 **Requirements:**
 
-- **REQ-PGPP-032:** Callbacks execute on the worker thread, not the calling thread.
+- **REQ-PGPP-032:** A callback runs on the executor thread that executed the request, after the request's connection was returned (REQ-PGPP-069); on the calling thread, with `nullopt`, when the request could not be queued (REQ-PGPP-033); on an executor thread, with `nullopt`, when the request was drained at shutdown. A request issued from a callback is queued like any other and runs later, on whichever executor thread picks it up.
 - **REQ-PGPP-033:** If shutting down, enqueue fails, or the request cannot be built, the callback receives `nullopt` immediately on the calling thread, exactly once. An exception thrown by the callback there is caught and dropped (REQ-PGPP-061).
+- **REQ-PGPP-041:** The executor catches all exceptions from tasks (both `std::exception` and `...`), logs them and keeps serving; a lease still held by the throwing task is returned by RAII.
+- *Rule for callers:* do not block on a future from inside a callback. That blocks an executor thread on work queued to the same executor, which at pool size 1 is the thread itself. The synchronous API (REQ-PGPP-028) is the right tool there.
 
 ### 5.6 Transactions
 
 | Method | Signature | Description |
 |---|---|---|
-| `transaction` | `template<F> future<optional<bool>> transaction(F&& work)` | Executes `BEGIN`, calls `work(PgppConnection&)` (returning `void` or a value convertible to `bool`), then `COMMIT`. Executes `ROLLBACK` and resolves with `false` if `work` threw, returned `false`, or left the connection in any state other than a healthy open transaction (a failed statement aborts it). Resolves with `true` only if PostgreSQL reports `COMMIT`. |
+| `transaction` | `template<F> future<optional<bool>> transaction(F&& work)` | On the executor, with its own lease: `BEGIN`, `work(PgppConnection&)` (returning `void` or a value convertible to `bool`), `COMMIT`. `ROLLBACK` and `false` if `work` threw, returned `false`, or left the connection in any state other than a healthy open transaction (a failed statement aborts it). `true` only if PostgreSQL reports `COMMIT`. `nullopt` if no lease. |
+| `transactionSync` | `template<F> bool transactionSync(F&& work)` | The same protocol on the calling thread (5.3). |
+
+Inside `work`, use the connection you were given. A pool call from there acquires a second
+connection (REQ-PGPP-067): it is autocommit, independent of the transaction, and it fails after
+`acquireTimeout` when no other connection is free. A `transaction()` started from inside `work`
+is likewise an independent transaction on its own connection.
 
 **Requirements:**
 
@@ -281,67 +298,78 @@ Thread-safe connection pool. One worker thread per connection.
 
 | Method | Signature | Description |
 |---|---|---|
-| `enqueueRaw` | `bool enqueueRaw(unique_ptr<PgppRequest>)` | Pushes a request onto the queue. Returns `false` if shutting down. Public for coroutine awaitables. |
+| `enqueueRaw` | `bool enqueueRaw(unique_ptr<PgppRequest>)` | Queues a task on the executor. Returns `false` if the pool is not running. Public for coroutine awaitables. |
 
 **Requirements:**
 
-- **REQ-PGPP-037:** Must hold `m_queueMutex` during the push and `notify_one`.
-- **REQ-PGPP-038:** Must return `false` (without enqueuing) if `m_shuttingDown` is `true`.
+- **REQ-PGPP-037:** Must hold `m_taskMutex` during the push, then `notify_one`.
+- **REQ-PGPP-038:** Must return `false` (without enqueuing) if the pool is not initialized or the executor is stopping.
 
 ### 5.8 Pool Statistics
 
 | Method | Return | Description |
 |---|---|---|
-| `totalConnections()` | `size_t`, `noexcept` | Number of connections created |
-| `freeConnections()` | `size_t`, `noexcept` | `total - busy` (clamped to 0) |
-| `busyConnections()` | `size_t`, `noexcept` | Current value of `m_busyWorkers` atomic |
-| `queuedRequests()` | `size_t` (`noexcept`) | Current queue size (acquires lock; 0 if the lock fails) |
+| `totalConnections()` | `size_t`, `noexcept` | Number of connections open in the pool |
+| `freeConnections()` | `size_t`, `noexcept` | Connections on the free-list |
+| `busyConnections()` | `size_t`, `noexcept` | Connections currently leased |
+| `queuedRequests()` | `size_t`, `noexcept` | Tasks waiting in the executor queue (0 if the lock fails) |
 
 **Requirements:**
 
-- **REQ-PGPP-039:** `freeConnections` must never underflow (returns 0 if `busy > total`).
-- **REQ-PGPP-040:** `queuedRequests` must acquire `m_queueMutex` for a consistent read.
+- **REQ-PGPP-039:** `freeConnections` must never underflow; `free + busy == total` under the pool lock.
+- **REQ-PGPP-040:** The getters read under the mutex that guards what they report (`m_mutex` for connections, `m_taskMutex` for the queue), so they are consistent and race-free against `initialize`/`shutdown`.
 
 ---
 
-## 6. Worker Thread Model
+## 6. Threading Model
 
-### 6.1 Thread Architecture
+### 6.1 Shared state (complete inventory)
 
-- One `std::thread` per connection (`m_workerThreads[i]` owns `m_connections[i]`).
-- Workers block on `m_requestQueued` condition variable, waking on: new request, shutdown, or statement version change.
+| State | Guard |
+|---|---|
+| free-list, leased count, stop flag, acquire timeout | `m_mutex` + `m_idleAvailable` |
+| executor queue, executor stop flag, executor thread ids | `m_taskMutex` + `m_taskAvailable` |
+| registered statements | `m_stmtMutex` |
+| `initialize` / `shutdown` from non-executor threads, the thread handles | `m_lifecycleMutex` |
+| `m_initialized` | atomic |
 
-### 6.2 Worker Loop (`workerLoop`)
+No thread-local state, no nesting counters. The lock order is `m_lifecycleMutex` → any other;
+`m_mutex` and `m_taskMutex` are never held together.
+
+### 6.2 Executor loop
 
 ```
-while (!shuttingDown):
-    lock(queueMutex)
-    wait(requestQueued, predicate: !queue.empty || shuttingDown || stmtVersion changed)
-    if shuttingDown: break
-    if queue not empty: pop request
-    unlock
+loop:
+    lock(taskMutex); wait(taskAvailable, predicate: stopping || !queue.empty)
+    if queue empty: exit thread                 (stopping and drained)
+    pop request; stopping = taskStopping; unlock
+    lease = stopping ? empty : acquire(no timeout)   (wakes empty when shutdown begins)
+    try: request.task(lease)                    (the task returns the lease before completing, REQ-069)
+    catch: log
+```
 
-    if stmtVersion changed: re-prepare all statements on this connection
+### 6.3 Acquisition and return
 
-    if no request: continue
+```
+acquire(timeout):
+    lock(mutex); if not running: return empty
+    wait(idleAvailable, predicate: stopping || !idle.empty, timeout); if stopping/timeout: return empty
+    pop slot; leased++; unlock
+    if connection lost: PQreset; if still lost: return slot, return empty   (REQ-042)
+    prepare statements registered since this connection last caught up     (REQ-026, 043)
+    return lease
 
-    if connection lost:
-        PQreset
-        if restored: re-prepare statements
-        else: task(nullptr), continue
-
-    busyWorkers++
-    try: task(conn)
-    catch: log exception
-    busyWorkers--
+release(slot):
+    if transaction open or aborted: ROLLBACK, warn                           (REQ-072)
+    lock(mutex); leased--; stopping ? close : push idle; unlock; notify_all
 ```
 
 **Requirements:**
 
-- **REQ-PGPP-041:** Workers must catch all exceptions from tasks (both `std::exception` and `...`).
-- **REQ-PGPP-042:** On connection loss, the worker must attempt `PQreset`. If reset fails, deliver `nullptr` to the task.
-- **REQ-PGPP-043:** After successful reconnection, all registered statements must be re-prepared on that connection.
-- **REQ-PGPP-044:** `m_busyWorkers` must be incremented before task execution and decremented after, using `memory_order_relaxed`.
+- **REQ-PGPP-042:** On connection loss, `acquire` must attempt `PQreset` on the caller's thread. If the reset fails, the connection goes back to the free-list and the caller gets an empty lease (`false` / `nullopt`).
+- **REQ-PGPP-043:** After a successful reconnection the connection's prepared count is reset, so every registered statement is prepared again before the lease is handed out.
+- **REQ-PGPP-044:** *Retired.* `busyConnections()` is the leased count under `m_mutex`.
+- **REQ-PGPP-072:** A connection is returned clean. If `PQtransactionStatus` is `PQTRANS_INTRANS` or `PQTRANS_INERROR` when a lease is released (a caller issued `BEGIN` through the raw API and never ended it, or an error aborted a transaction a caller left open), the pool issues `ROLLBACK` and logs a warning before the connection goes back to the free-list. A caller's stray transaction can therefore neither swallow the next caller's writes nor leave the connection unusable. Session settings (`SET`, `SET ROLE`, temporary tables) are *not* reset: connections have no caller affinity, so use `SET LOCAL` inside `transaction()` for per-request settings.
 
 ---
 
@@ -369,7 +397,7 @@ Minimal coroutine return type for fire-and-forget async tasks.
 Awaitable for executing a prepared statement without results.
 
 - `await_ready` returns `false` (always suspends).
-- `await_suspend` creates a `PgppRequest`, enqueues it, resumes the coroutine handle from the worker thread.
+- `await_suspend` creates a `PgppRequest`, enqueues it on the executor; the task runs the statement with its lease, returns the lease, then resumes the coroutine handle on the executor thread.
 - `await_resume` returns `std::optional<bool>` (`nullopt` if connection was `nullptr`).
 - State (statement, arguments, result) lives inline in the awaitable, i.e. in the awaiting coroutine's frame; the request's task captures `this`. The caller must keep the coroutine alive until it is resumed (FireAndForget does so by construction).
 - `await_suspend`, `await_ready` and the state are shared with `DbResultAwaitable` via `Internal::DbAwaitableBase` (CRTP).
@@ -377,7 +405,7 @@ Awaitable for executing a prepared statement without results.
 
 **Requirements:**
 
-- **REQ-PGPP-047:** The coroutine resumes on the worker thread (not the original thread).
+- **REQ-PGPP-047:** The coroutine resumes on the executor thread that executed the request (not the original thread), with the request's connection already back in the pool (REQ-PGPP-069); at shutdown it resumes with `nullopt` on the draining executor thread.
 - **REQ-PGPP-048:** Arguments are captured by value in a `std::tuple` to ensure lifetime safety.
 - **REQ-PGPP-058:** The awaiting coroutine is resumed exactly once for every enqueued request; when the statement fails the result is `false`, when the request is drained at shutdown it is `nullopt`.
 
@@ -481,33 +509,33 @@ be distinguishable from failure, and `std::expected<T, E>` where the reason matt
 | REQ-PGPP-018 | Failed exec logs error | 4.3 |
 | REQ-PGPP-019 | Pool initialize is idempotent | 5.1 |
 | REQ-PGPP-020 | Pool shutdown is safe to call multiple times | 5.1 |
-| REQ-PGPP-021 | Shutdown drains pending requests with nullptr | 5.1 |
-| REQ-PGPP-022 | Drain outside lock to avoid deadlock | 5.1 |
+| REQ-PGPP-021 | Shutdown drains pending requests with an empty lease (nullopt) | 5.1 |
+| REQ-PGPP-022 | Retired (tasks never run under a lock) | 5.1 |
 | REQ-PGPP-023 | Destructor calls shutdown | 5.1 |
 | REQ-PGPP-024 | Non-copyable pool | 5.1 |
 | REQ-PGPP-025 | Pre-init statements prepared during creation | 5.2 |
-| REQ-PGPP-026 | Post-init statements trigger lazy re-prepare | 5.2 |
+| REQ-PGPP-026 | Each connection prepares the statements registered since its last acquisition | 5.2 |
 | REQ-PGPP-027 | Statement list mutex-protected | 5.2 |
-| REQ-PGPP-028 | Sync methods block on async futures | 5.3 |
-| REQ-PGPP-029 | Shutting down resolves future with nullopt | 5.4 |
+| REQ-PGPP-028 | Sync methods run on the calling thread with their own lease; never the executor | 5.3 |
+| REQ-PGPP-029 | Pool not running resolves future with nullopt | 5.4 |
 | REQ-PGPP-030 | Enqueue failure resolves with nullopt | 5.4 |
-| REQ-PGPP-031 | Null connection resolves with nullopt | 5.4 |
-| REQ-PGPP-032 | Callbacks execute on worker thread | 5.5 |
+| REQ-PGPP-031 | Empty lease resolves with nullopt | 5.4 |
+| REQ-PGPP-032 | Callbacks run on an executor thread after the connection was returned; from a callback, requests queue | 5.5 |
 | REQ-PGPP-033 | Shutdown/enqueue fail delivers nullopt to callback | 5.5 |
 | REQ-PGPP-034 | BEGIN failure resolves with false | 5.6 |
 | REQ-PGPP-035 | Exception triggers ROLLBACK | 5.6 |
 | REQ-PGPP-036 | COMMIT succeeded only with status OK and tag "COMMIT" | 5.6 |
-| REQ-PGPP-037 | enqueueRaw holds mutex during push | 5.7 |
-| REQ-PGPP-038 | enqueueRaw returns false if shutting down | 5.7 |
-| REQ-PGPP-039 | freeConnections never underflows | 5.8 |
-| REQ-PGPP-040 | queuedRequests acquires mutex | 5.8 |
-| REQ-PGPP-041 | Workers catch all exceptions | 6.2 |
-| REQ-PGPP-042 | Connection loss triggers PQreset | 6.2 |
-| REQ-PGPP-043 | Re-prepare after reconnect | 6.2 |
-| REQ-PGPP-044 | busyWorkers atomic increment/decrement | 6.2 |
+| REQ-PGPP-037 | enqueueRaw holds the task mutex during push | 5.7 |
+| REQ-PGPP-038 | enqueueRaw returns false if not running | 5.7 |
+| REQ-PGPP-039 | free + busy == total; never underflows | 5.8 |
+| REQ-PGPP-040 | Statistics read under the guarding mutex | 5.8 |
+| REQ-PGPP-041 | Executor catches all exceptions from tasks | 5.5 |
+| REQ-PGPP-042 | Connection loss triggers PQreset in acquire | 6.3 |
+| REQ-PGPP-043 | Re-prepare after reconnect | 6.3 |
+| REQ-PGPP-044 | Retired (leased count under the pool mutex) | 6.3 |
 | REQ-PGPP-045 | FireAndForget never leaks frame | 7.1 |
 | REQ-PGPP-046 | FireAndForget catches unhandled exceptions | 7.1 |
-| REQ-PGPP-047 | Coroutine resumes on worker thread | 7.2 |
+| REQ-PGPP-047 | Coroutine resumes on the executing executor thread, connection already returned | 7.2 |
 | REQ-PGPP-048 | Arguments captured by value | 7.2 |
 | REQ-PGPP-049 | Result rows moved out in await_resume | 7.3 |
 | REQ-PGPP-050 | Factory functions decay argument types | 7.4 |
@@ -519,11 +547,17 @@ be distinguishable from failure, and `std::expected<T, E>` where the reason matt
 | REQ-PGPP-056 | Supports PostgreSQL 13-17 | 9 |
 | REQ-PGPP-057 | Decoding failure fails the query, no partial rows | 3 |
 | REQ-PGPP-058 | Awaitable always resumes, even if execution throws | 7.2 |
-| REQ-PGPP-059 | Workers start from a pre-creation statement version (no lost prepareStatement at start-up) | 5.2 |
-| REQ-PGPP-060 | Shutdown flag flipped under the queue mutex (no lost wake-up, shutdown never hangs) | 5.1 |
+| REQ-PGPP-059 | Retired (no worker threads; covered by REQ-PGPP-026) | 5.2 |
+| REQ-PGPP-060 | Every stop flag is set under its waiters' mutex; shutdown never hangs | 5.1 |
 | REQ-PGPP-061 | No exceptions: failures are return values (bool / optional / expected) | 10 |
 | REQ-PGPP-062 | Results requested in binary format; parameters stay text | 4.3 |
 | REQ-PGPP-063 | Fewer result columns than requested fails the query | 4.3 |
 | REQ-PGPP-064 | initialize rolls back on any failure; shutdown drains without allocating | 10 |
 | REQ-PGPP-065 | Aborted (or otherwise not open) transaction after work: ROLLBACK, false | 5.6 |
 | REQ-PGPP-066 | work returning false: ROLLBACK, false | 5.6 |
+| REQ-PGPP-067 | Connections are used only through leases; a nested call gets a second connection or times out | 5.3 |
+| REQ-PGPP-068 | *(see REQ-PGPP-028)* sync API on the calling thread, never the executor | 5.3 |
+| REQ-PGPP-069 | Executor tasks return the lease before completing the future / callback / coroutine | 5.4 |
+| REQ-PGPP-070 | shutdown(): synchronous from outside, non-blocking from an executor thread; destructor never from one | 5.1 |
+| REQ-PGPP-071 | initialize/shutdown serialised; executor threads never take the lifecycle lock | 5.1 |
+| REQ-PGPP-072 | A connection is returned clean: stray open/aborted transaction rolled back on release | 6.3 |

@@ -31,7 +31,8 @@ auto [ok, rows] = f2.get();
 
 ## Callback-based API
 
-Callback runs directly on the DB worker thread — no blocking, no extra threads.
+The callback runs on one of the pool's executor threads, after the statement's connection has
+been returned to the pool.
 
 ```cpp
 db.exec("delete_account", [](std::optional<bool> ok) {
@@ -84,7 +85,8 @@ auto f = db.execRawAsync("VACUUM ANALYZE account");
 
 ## Transactions
 
-`transaction` runs `BEGIN`, calls `work(conn)` on the worker thread, then `COMMIT`. The future
+`transaction` takes a connection, runs `BEGIN`, calls `work(conn)` on an executor thread, then
+`COMMIT`; `transactionSync` does the same on the calling thread and returns the `bool`. The future
 resolves `true` only if PostgreSQL actually committed. It resolves `false`, after a `ROLLBACK`, when:
 
 - any statement inside `work` failed: PostgreSQL then leaves the transaction *aborted*, and a
@@ -108,6 +110,41 @@ bool committed = f.get().value_or(false);   // nullopt only when the pool is shu
 A `void` work is equivalent to one that always returns `true`: it still rolls back if a
 statement failed, it just cannot abort on its own without throwing.
 
+## Leases
+
+The pool is a free-list of connections. Every API takes one for the duration of a request and
+returns it. You can do the same yourself when several statements must share one connection
+without a transaction:
+
+```cpp
+if (auto conn = db.acquire()) {           // waits up to PgppConnectionInfo::acquireTimeout
+    conn->execRaw("SET LOCAL statement_timeout = 1000");
+    conn->execPrepared("report", id);
+}                                         // returned here
+```
+
+An empty lease means no connection became free in time (default 30 s, configurable through
+`acquireTimeout`), or the pool is not running.
+
+## Calling the Pool from a Callback or Transaction
+
+Callbacks, `transaction()` work and coroutine bodies after `co_await` run on the pool's executor
+threads. Three rules keep that simple:
+
+- **The sync API is always fine.** `execSync`, `querySync`, `execRawSync` and `transactionSync`
+  acquire a connection on the calling thread and never touch the executor, so they work from a
+  callback even with a pool of one: the callback's own connection is already back in the pool.
+- **Inside `transaction()` work, use the connection you were given.** A pool call from there
+  takes a *second* connection: it is autocommit, independent of your transaction, and with a pool
+  of one it fails after `acquireTimeout` rather than joining the transaction.
+- **Do not block on a future inside a callback.** `execAsync(...).get()` there waits for an
+  executor thread, and with a pool of one that is the thread you are on. Use the sync API, or
+  chain another callback.
+
+`shutdown()` from inside a callback returns immediately and finishes on the executor threads
+themselves; the next `shutdown()` or the destructor, from one of your own threads, waits for them.
+Never destroy the pool from a callback.
+
 ## Statement Preparation
 
 Statements are prepared once and available on all pool connections.
@@ -128,10 +165,10 @@ auto [ok, rows] = db.querySync<std::tuple<std::string, int>>(
 ## Pool Statistics
 
 ```cpp
-db.totalConnections();  // pool size
-db.freeConnections();   // idle workers
-db.busyConnections();   // executing queries
-db.queuedRequests();    // waiting in queue
+db.totalConnections();  // connections in the pool
+db.freeConnections();   // on the free-list
+db.busyConnections();   // currently leased
+db.queuedRequests();    // tasks waiting for an executor thread
 ```
 
 ## Logging
@@ -155,8 +192,13 @@ pgpp never throws. Every public function is `noexcept` and reports failure throu
 value: `false`, `std::nullopt` (shutdown, no connection, or the request could not be built), an
 already-resolved future, or an awaitable that completes at once. Check `future.valid()` only if
 you want to distinguish the extreme case where not even the result promise could be allocated;
-the sync wrappers already treat that as `false`. A callback that throws is caught: on a worker
+the sync wrappers already treat that as `false`. A callback that throws is caught: on an executor
 thread it is logged, on the calling thread it is dropped.
+
+A connection always comes back clean: if a caller left a transaction open or aborted (a raw
+`BEGIN` without `COMMIT`, an error inside it), the pool rolls it back when the connection is
+returned, so it can neither swallow the next caller's writes nor stay unusable. Session settings
+made with `SET` are not reset; use `SET LOCAL` inside a transaction for per-request settings.
 
 ## Type Mapping
 

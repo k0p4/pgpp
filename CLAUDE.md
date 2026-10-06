@@ -76,17 +76,19 @@ pgpp/
 ## Key Classes
 
 ### PgppPool (thread-safe)
-Connection pool with worker-thread-per-connection model. Main entry point for applications.
+Free-list of connections handed out as RAII leases (`acquire()` → `Lease`), plus an executor
+(`poolSize` threads, one queue) for the async APIs. Main entry point for applications.
 - `initialize(PgppConnectionInfo, poolSize)` / `shutdown()`
-- `prepareStatement(Statement)` -- registers prepared statements on all connections
-- `execSync` / `querySync` -- blocking convenience wrappers
-- `execAsync` / `queryAsync` -- return `std::future`
-- `exec` / `query` -- callback-based, fires on worker thread
+- `prepareStatement(Statement)` -- registers a statement; each connection prepares it on its next acquisition
+- `acquire()` -- a leased connection for the calling thread (waits up to `acquireTimeout`)
+- `execSync` / `querySync` / `execRawSync` / `transactionSync` -- run on the calling thread with their own lease; never use the executor
+- `execAsync` / `queryAsync` -- return `std::future`; run on the executor
+- `exec` / `query` -- callback-based, fires on an executor thread after the connection was returned
 - `transaction(work)` -- BEGIN, `work(conn)` (returns void or bool), COMMIT; ROLLBACK and `false` if a statement failed, `work` returned false or threw
 - `execRawSync` / `execRawAsync` -- non-prepared SQL
 
 ### PgppConnection (NOT thread-safe)
-Single connection wrapper. Used internally by pool workers. Direct use is for testing only.
+Single connection wrapper. Reached through a `PgppPool::Lease`; direct construction is for testing only.
 - `open` / `close` / `reset` / `isOpen` / `lastError`
 - `prepare` / `isPrepared`
 - `execRaw` / `execPrepared` (with and without result vectors)
@@ -111,7 +113,7 @@ When changing API, tests, or build system — update the corresponding docs:
 ## Key Conventions
 
 - **Logging:** Compile-time selectable via `PGPP_USE_ALOG` or `PGPP_USE_STDERR`; defaults to no-op
-- **Threading:** Pool is thread-safe (mutex + condition_variable + atomics). Connection is NOT thread-safe.
+- **Threading:** Pool is thread-safe; a connection is used only by the holder of its lease, on the holder's thread. Sync API = acquire on the calling thread (no executor, safe from callbacks); async/callback/coroutine/`transaction()` = executor task that acquires, runs, returns the lease, then completes. Inside `transaction()` work use the given connection (a pool call there takes a second connection). Never block on a future inside a callback. `shutdown()` from an executor thread is non-blocking; never destroy the pool from one. A returned connection is rolled back if left in a transaction (REQ-PGPP-072). The whole suite runs under ThreadSanitizer in CI. Connection is NOT thread-safe.
 - **Result decoding:** results are fetched in binary format (REQ-PGPP-062) and decoded by column OID into string / any integral type / double / float / bool, range-checked. No text parsing. Non-text columns read into `std::string` need `::text` in SQL; `numeric` needs `::int8`/`::float8`. NULL becomes the C++ default value.
 - **OIDs:** Use `pg::` namespace constants (e.g., `pg::TEXT`, `pg::INT4`), not legacy macros
 - **Parameters:** All query parameters are passed as text-format strings (`.c_str()`); only results are binary
