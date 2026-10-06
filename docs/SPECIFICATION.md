@@ -1,6 +1,6 @@
 # pgpp Specification
 
-> C++20 PostgreSQL Connection Pool Library
+> C++23 PostgreSQL Connection Pool Library
 
 ## Overview
 
@@ -66,20 +66,30 @@ Type OID constants matching the PostgreSQL system catalog (`pg_type.oid`). Used 
 
 | Constant | Value | PostgreSQL Type |
 |---|---|---|
+| `pg::BOOL` | 16 | boolean |
 | `pg::BYTEA` | 17 | bytea |
 | `pg::CHAR` | 18 | "char" |
+| `pg::NAME` | 19 | name |
 | `pg::INT8` | 20 | bigint (int8) |
 | `pg::INT2` | 21 | smallint (int2) |
 | `pg::INT4` | 23 | integer (int4) |
 | `pg::TEXT` | 25 | text |
+| `pg::OID` | 26 | oid |
+| `pg::JSON` | 114 | json |
+| `pg::XML` | 142 | xml |
 | `pg::FLOAT4` | 700 | real (float4) |
 | `pg::FLOAT8` | 701 | double precision (float8) |
+| `pg::UNKNOWN` | 705 | unknown (untyped string literal) |
+| `pg::BPCHAR` | 1042 | character(n) |
 | `pg::VARCHAR` | 1043 | varchar |
 | `pg::DATE` | 1082 | date |
 | `pg::TIME` | 1083 | time |
 | `pg::TIMESTAMP` | 1114 | timestamp |
 | `pg::TIMESTAMPTZ` | 1184 | timestamptz |
 | `pg::TIMETZ` | 1266 | timetz |
+| `pg::NUMERIC` | 1700 | numeric |
+| `pg::CSTRING` | 2275 | cstring |
+| `pg::JSONB` | 3802 | jsonb |
 
 Legacy OID macros (e.g., `TEXTOID`, `INT4OID`) are available only when `PGPP_ENABLE_OID_MACROS` is defined before including the header.
 
@@ -90,25 +100,36 @@ Legacy OID macros (e.g., `TEXTOID`, `INT4OID`) are available only when `PGPP_ENA
 
 ---
 
-## 3. Type Conversions
+## 3. Result Decoding (binary format)
 
-The `Internal::Details::convertPQValue<T>` template family converts libpq text-format results to C++ types.
+The result overload of `execPrepared` asks libpq for results in **binary format** (REQ-PGPP-062), so
+every cell is the PostgreSQL wire encoding of its column type: integers and IEEE floats in network byte
+order, booleans as one byte, textual types as the raw text. Nothing is parsed from text.
+`Internal::Details::decodeBinary<T>(oid, bytes)` decodes one cell into the requested C++ type and returns
+`std::expected<T, ConversionError>` (`Converted<T>`); it never throws.
 
-| C++ Type | Conversion | NULL Handling |
+`ConversionError` is one of:
+
+| Value | Meaning |
+|---|---|
+| `TypeMismatch` | the column's PostgreSQL type cannot be read into the requested C++ type |
+| `OutOfRange` | the value does not fit the requested C++ type |
+| `Malformed` | the cell is not the size its type's binary encoding requires |
+
+| C++ type | Accepted column types | Rule |
 |---|---|---|
-| `std::string` | Raw string passthrough | Default-constructed (empty string) |
-| `int` | `std::stoi` | Default-constructed (0) |
-| `int16_t` | `std::stoi` then `static_cast<int16_t>` | Default-constructed (0) |
-| `int64_t` | `std::stoll` | Default-constructed (0) |
-| `uint32_t` | `std::stoul` then `static_cast<uint32_t>` | Default-constructed (0) |
-| `double` | `std::stod` | Default-constructed (0.0) |
-| `float` | `std::stof` | Default-constructed (0.0f) |
-| `bool` | `true` if first char is `t`, `T`, or `1`; `false` otherwise | Default-constructed (false) |
+| `std::string` | `char`, `name`, `text`, `json`, `xml`, `unknown`, `bpchar`, `varchar`, `cstring`, `jsonb` (version byte stripped) | bytes copied as-is. Any other column (int, timestamp, uuid, numeric, ...) is `TypeMismatch`: cast to `::text` in the SQL. |
+| any integral type (`int`, `int16_t`, `int64_t`, `uint32_t`, ...) except `bool` | `int2`, `int4`, `int8`, `oid` | widened to 64 bits, then range-checked against `T` with `std::in_range`: 40000 into `int16_t`, or -1 / 5000000000 into `uint32_t`, is `OutOfRange`, never a silent wrap. |
+| `double`, `float` | `float4`, `float8`, and the integer types above | `float8` into `float` is `OutOfRange` when finite and above `FLT_MAX`; infinities and NaN pass through. |
+| `bool` | `boolean` | one byte, non-zero is `true`. |
+
+`numeric` has no decoder: select it as `::int8` or `::float8`. NULL cells never reach a decoder.
 
 **Requirements:**
 
-- **REQ-PGPP-008:** NULL values (detected via `PQgetisnull`) must leave the target at its default-constructed value; the converter is never called for NULL fields.
-- **REQ-PGPP-009:** Conversion functions must handle all valid PostgreSQL text representations for their respective types.
+- **REQ-PGPP-008:** NULL values (detected via `PQgetisnull`) must leave the target at its default-constructed value; the decoder is never called for NULL fields.
+- **REQ-PGPP-009:** A decoder must accept exactly the column types listed above for its C++ type and reject every other column type with `TypeMismatch`; it must verify the cell size of fixed-width types and report `Malformed` otherwise.
+- **REQ-PGPP-057:** A cell that cannot be decoded (`TypeMismatch`, `OutOfRange` or `Malformed`) fails the whole query: `fillTupleFromPQValues` returns `false` at the first failing column, and the result overload of `execPrepared` logs the row via `logConversionError`, removes any rows it already appended, and returns `false`. No partial result and no exception ever reaches callers, futures, callbacks, or coroutines.
 
 ---
 
@@ -153,7 +174,7 @@ Single-connection wrapper around a `PGconn*`. NOT thread-safe.
 |---|---|---|
 | `execRaw` | `bool execRaw(const std::string& sql)` | Executes raw SQL via `PQexec`. Returns `true` if status is `PGRES_COMMAND_OK` or `PGRES_TUPLES_OK`. |
 | `execPrepared` (no results) | `template<typename... Ts> bool execPrepared(name, args...)` | Executes a prepared statement expecting `PGRES_COMMAND_OK` (INSERT, UPDATE, DELETE). All args must have `.c_str()`. |
-| `execPrepared` (with results) | `template<typename... Ts, typename... TAs> bool execPrepared(name, vector<tuple<TAs...>>&, args...)` | Executes a prepared statement expecting `PGRES_TUPLES_OK` (SELECT). Appends rows to the result vector. |
+| `execPrepared` (with results) | `template<typename... Ts, typename... TAs> bool execPrepared(name, vector<tuple<TAs...>>&, args...)` | Executes a prepared statement expecting `PGRES_TUPLES_OK` (SELECT) with binary results (REQ-PGPP-062). Looks up each column's type OID once, checks the column count (REQ-PGPP-063), then appends rows to the result vector; on a decoding failure appends nothing and returns `false` (REQ-PGPP-057). |
 
 **Requirements:**
 
@@ -161,6 +182,8 @@ Single-connection wrapper around a `PGconn*`. NOT thread-safe.
 - **REQ-PGPP-016:** `execPrepared` passes all arguments as text-format strings via `.c_str()`.
 - **REQ-PGPP-017:** The result overload of `execPrepared` must append to (not replace) the result vector, using `reserve` for efficiency.
 - **REQ-PGPP-018:** Failed executions must log the error via `logTemplateError`.
+- **REQ-PGPP-062:** The result overload of `execPrepared` requests binary results (`PQexecPrepared` result format 1). Parameters remain text (REQ-PGPP-016). Column types are read with `PQftype` once per result and passed to the decoders.
+- **REQ-PGPP-063:** If the result has fewer columns than the requested tuple, `execPrepared` logs via `logColumnCountError` and returns `false` without decoding. Extra columns are ignored.
 
 ---
 
@@ -176,7 +199,7 @@ Thread-safe connection pool. One worker thread per connection.
 | Destructor | `~PgppPool()` | Calls `shutdown()` |
 | `initialize` | `bool initialize(const PgppConnectionInfo&, size_t poolSize=0)` | Builds connection string, creates connections, prepares registered statements, starts worker threads. If `poolSize > 0`, overrides the default. |
 | `shutdown` | `void shutdown()` | Stops workers, drains pending requests (delivers `nullptr`), closes connections |
-| `isInitialized` | `bool isInitialized() const` | Atomic check |
+| `isInitialized` | `bool isInitialized() const noexcept` | Atomic check |
 
 **Requirements:**
 
@@ -184,6 +207,7 @@ Thread-safe connection pool. One worker thread per connection.
 - **REQ-PGPP-020:** `shutdown` must be safe to call multiple times (atomic guard on `m_initialized`).
 - **REQ-PGPP-021:** `shutdown` must drain all pending requests, invoking each task with `nullptr` so that futures receive `std::nullopt`.
 - **REQ-PGPP-022:** Pending requests are drained outside the queue lock to avoid deadlock when tasks call `enqueueRaw` (e.g., coroutine resumption).
+- **REQ-PGPP-060:** `stopWorkerThreads` must set `m_shuttingDown` while holding `m_queueMutex` and only then notify `m_requestQueued`. Workers test the flag inside their wait predicate; flipping it outside the mutex can land between that test and the actual block, the notification is lost, and `join()` never returns. `shutdown()` must never hang, however soon after `initialize()` it is called.
 - **REQ-PGPP-023:** Destructor must call `shutdown()`.
 - **REQ-PGPP-024:** Copy construction and copy assignment are deleted.
 
@@ -197,13 +221,14 @@ Thread-safe connection pool. One worker thread per connection.
 
 - **REQ-PGPP-025:** Statements registered before `initialize` are prepared during connection creation.
 - **REQ-PGPP-026:** Statements registered after `initialize` trigger lazy re-preparation on all worker threads via the `m_stmtVersion` atomic.
+- **REQ-PGPP-059:** Each worker starts from the statement version captured by `startWorkerThreads` *before* the thread is created (passed as an argument to `workerLoop`), not from a load in the thread body. A `prepareStatement` call that lands between thread creation and the worker's first instruction therefore still shows up as a version mismatch and is prepared before the worker serves its first request. A statement registered immediately after `initialize()` returns must be usable by the very next `exec`/`query`.
 - **REQ-PGPP-027:** Statement list is protected by `m_stmtMutex`.
 
 ### 5.3 Synchronous API
 
 | Method | Signature | Description |
 |---|---|---|
-| `execSync` | `template<Ts...> bool execSync(name, args...)` | Blocks on `execAsync(...).get()`. Returns `true` only if the future contains `true`. |
+| `execSync` | `template<Ts...> bool execSync(name, args...)` | Blocks on `execAsync(...).get()`. Returns `true` only if the future contains `true`; `false` if the future is invalid (REQ-PGPP-061). |
 | `querySync` | `template<RowTuple, Ts...> pair<bool, vector<RowTuple>> querySync(name, args...)` | Blocks on `queryAsync(...).get()`. Returns `{false, {}}` if the future contained `nullopt`. |
 | `execRawSync` | `bool execRawSync(const string& sql)` | Blocks on `execRawAsync(...).get()`. |
 
@@ -222,6 +247,7 @@ Thread-safe connection pool. One worker thread per connection.
 **Requirements:**
 
 - **REQ-PGPP-029:** If `m_shuttingDown` is `true` at call time, the future must be immediately resolved with `nullopt`.
+- **REQ-PGPP-029a:** If the request cannot be built or queued (allocation failure, an argument whose copy throws), the future is resolved with `nullopt`; if not even that promise can be allocated, an invalid future is returned (REQ-PGPP-061).
 - **REQ-PGPP-030:** If `enqueueRaw` fails (returns `false`), the promise must be resolved with `nullopt`.
 - **REQ-PGPP-031:** If the worker receives a `nullptr` connection, the promise must be resolved with `nullopt`.
 
@@ -235,7 +261,7 @@ Thread-safe connection pool. One worker thread per connection.
 **Requirements:**
 
 - **REQ-PGPP-032:** Callbacks execute on the worker thread, not the calling thread.
-- **REQ-PGPP-033:** If shutting down or enqueue fails, the callback receives `nullopt` immediately on the calling thread.
+- **REQ-PGPP-033:** If shutting down, enqueue fails, or the request cannot be built, the callback receives `nullopt` immediately on the calling thread, exactly once. An exception thrown by the callback there is caught and dropped (REQ-PGPP-061).
 
 ### 5.6 Transactions
 
@@ -264,10 +290,10 @@ Thread-safe connection pool. One worker thread per connection.
 
 | Method | Return | Description |
 |---|---|---|
-| `totalConnections()` | `size_t` | Number of connections created |
-| `freeConnections()` | `size_t` | `total - busy` (clamped to 0) |
-| `busyConnections()` | `size_t` | Current value of `m_busyWorkers` atomic |
-| `queuedRequests()` | `size_t` | Current queue size (acquires lock) |
+| `totalConnections()` | `size_t`, `noexcept` | Number of connections created |
+| `freeConnections()` | `size_t`, `noexcept` | `total - busy` (clamped to 0) |
+| `busyConnections()` | `size_t`, `noexcept` | Current value of `m_busyWorkers` atomic |
+| `queuedRequests()` | `size_t` (`noexcept`) | Current queue size (acquires lock; 0 if the lock fails) |
 
 **Requirements:**
 
@@ -328,6 +354,8 @@ Minimal coroutine return type for fire-and-forget async tasks.
 - `initial_suspend` returns `suspend_never` (starts immediately).
 - `final_suspend` returns `suspend_never` (self-destructs on completion).
 - `unhandled_exception` catches and logs to `stderr`.
+- `get_return_object_on_allocation_failure` makes frame allocation non-throwing: on failure the coroutine body never runs and the call returns normally (REQ-PGPP-061).
+- A coroutine lambda's closure is referenced, not copied, by the frame: callers must keep it alive until the coroutine completes (a named variable, or a plain coroutine function whose parameters are copied into the frame). An immediately-invoked temporary lambda is a dangling-closure bug.
 
 **Requirements:**
 
@@ -341,11 +369,15 @@ Awaitable for executing a prepared statement without results.
 - `await_ready` returns `false` (always suspends).
 - `await_suspend` creates a `PgppRequest`, enqueues it, resumes the coroutine handle from the worker thread.
 - `await_resume` returns `std::optional<bool>` (`nullopt` if connection was `nullptr`).
+- State (statement, arguments, result) lives inline in the awaitable, i.e. in the awaiting coroutine's frame; the request's task captures `this`. The caller must keep the coroutine alive until it is resumed (FireAndForget does so by construction).
+- `await_suspend`, `await_ready` and the state are shared with `DbResultAwaitable` via `Internal::DbAwaitableBase` (CRTP).
+- `coExec` / `coQuery` are `noexcept`: if the statement or an argument cannot be copied into the awaitable, or the request cannot be built in `await_suspend`, the awaitable completes immediately with `nullopt` (REQ-PGPP-061).
 
 **Requirements:**
 
 - **REQ-PGPP-047:** The coroutine resumes on the worker thread (not the original thread).
 - **REQ-PGPP-048:** Arguments are captured by value in a `std::tuple` to ensure lifetime safety.
+- **REQ-PGPP-058:** The awaiting coroutine is resumed exactly once for every enqueued request; when the statement fails the result is `false`, when the request is drained at shutdown it is `nullopt`.
 
 ### 7.3 DbResultAwaitable<RowTuple, Ts...>
 
@@ -394,7 +426,7 @@ Macros: `PGPP_LOGV`, `PGPP_LOGD`, `PGPP_LOGW`, `PGPP_LOGE`.
 
 ## 9. Build System
 
-- CMake 3.16+, C++20 required.
+- CMake 3.20+, C++23 required (`std::expected`). The `pgpp` target declares `cxx_std_23` as a PUBLIC compile feature, so consumers (FetchContent included) inherit the standard without setting it themselves.
 - Static library target: `pgpp`.
 - Public dependency: `PostgreSQL::PostgreSQL` (via `find_package`).
 - Optional private dependency: `alog` (auto-detected via CMake target existence).
@@ -410,6 +442,19 @@ Macros: `PGPP_LOGV`, `PGPP_LOGD`, `PGPP_LOGW`, `PGPP_LOGE`.
 
 ---
 
+## 10. Error Handling Policy
+
+pgpp does not use exceptions. Every failure is reported through a return value: `bool` for
+execution results, `std::optional<bool>` where "no result at all" (shutdown, no connection) must
+be distinguishable from failure, and `std::expected<T, E>` where the reason matters (result decoding).
+
+**Requirements:**
+
+- **REQ-PGPP-061:** No exception leaves the library. Every public function of `PgppPool`, `PgppConnection` and the coroutine helpers is declared `noexcept`, and every operation inside the library that can throw (allocation while building a request or a result, copying a caller's arguments into a request, `std::thread` / mutex / condition-variable errors, `std::promise` operations, a user callback invoked on the calling thread) is wrapped in `try`/`catch` at the point where a failure value can still be produced. The failure values are: `false` for `bool` results and sync wrappers; a future already resolved with `nullopt` (or an *invalid* future, `valid() == false`, if even that promise cannot be allocated; the sync wrappers treat it as `false`); the callback fired exactly once with `nullopt`; an awaitable that completes immediately with `nullopt`; an empty string from `lastError`. Worker threads log and continue. Library code must not call standard functions whose only failure channel is an exception (`std::stoi` and friends); results are decoded from libpq's binary format. A user callback that throws on a worker thread is caught and logged there; on the calling thread it is caught and dropped. The log sink is called from these `noexcept` paths, including the handlers that report an allocation failure, so it must not throw: the stderr sink swallows stream errors, and an `alog` sink is required to be non-throwing. `shutdown()` (and therefore the destructor) must not be called from a worker thread, i.e. from inside a callback, a `transaction` body or a coroutine resumed by the pool: a thread cannot join itself, so that worker is detached and keeps running against a pool that is being torn down.
+- **REQ-PGPP-064:** `initialize` must leave the pool uninitialized (no connections, no threads) when any step fails, including thread creation; `shutdown` must drain the queue without allocating, so it cannot fail for lack of memory.
+
+---
+
 ## Requirements Index
 
 | ID | Summary | Section |
@@ -422,7 +467,7 @@ Macros: `PGPP_LOGV`, `PGPP_LOGD`, `PGPP_LOGW`, `PGPP_LOGE`.
 | REQ-PGPP-006 | OID values match PostgreSQL catalog | 2 |
 | REQ-PGPP-007 | Legacy macros delegate to pg:: constants | 2 |
 | REQ-PGPP-008 | NULL leaves default value | 3 |
-| REQ-PGPP-009 | Converters handle valid PG text formats | 3 |
+| REQ-PGPP-009 | Decoders accept exactly the listed column types per C++ type | 3 |
 | REQ-PGPP-010 | open is idempotent | 4.1 |
 | REQ-PGPP-011 | close is safe to call multiple times | 4.1 |
 | REQ-PGPP-012 | Non-copyable connection | 4.1 |
@@ -470,3 +515,11 @@ Macros: `PGPP_LOGV`, `PGPP_LOGD`, `PGPP_LOGW`, `PGPP_LOGE`.
 | REQ-PGPP-054 | Builds without alog | 9 |
 | REQ-PGPP-055 | PostgreSQL found via find_package | 9 |
 | REQ-PGPP-056 | Supports PostgreSQL 13-17 | 9 |
+| REQ-PGPP-057 | Decoding failure fails the query, no partial rows | 3 |
+| REQ-PGPP-058 | Awaitable always resumes, even if execution throws | 7.2 |
+| REQ-PGPP-059 | Workers start from a pre-creation statement version (no lost prepareStatement at start-up) | 5.2 |
+| REQ-PGPP-060 | Shutdown flag flipped under the queue mutex (no lost wake-up, shutdown never hangs) | 5.1 |
+| REQ-PGPP-061 | No exceptions: failures are return values (bool / optional / expected) | 10 |
+| REQ-PGPP-062 | Results requested in binary format; parameters stay text | 4.3 |
+| REQ-PGPP-063 | Fewer result columns than requested fails the query | 4.3 |
+| REQ-PGPP-064 | initialize rolls back on any failure; shutdown drains without allocating | 10 |

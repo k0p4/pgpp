@@ -63,6 +63,16 @@ TEST_F(PgppIntegrationTest, CoQueryReturnsRows)
 
 // ── IT-CORO-003: FireAndForget self-destructs ───────────────────────────────
 
+// A plain coroutine function: its parameters are copied into the frame.
+// (An immediately-invoked *temporary* lambda would be destroyed at the end
+// of the full expression while the frame still references its captures,
+// which ThreadSanitizer reported as a use of dead stack memory.)
+static FireAndForget insertAndCount(PgppPool& pool, std::string name, std::atomic<int>& completionCount)
+{
+    co_await coExec(pool, "coro_faf", name);
+    completionCount.fetch_add(1);
+}
+
 TEST_F(PgppIntegrationTest, FireAndForgetSelfDestructs)
 {
     pool.prepareStatement({"coro_faf", "INSERT INTO pgpp_test_table (name) VALUES ($1)", {pg::VARCHAR}});
@@ -71,11 +81,7 @@ TEST_F(PgppIntegrationTest, FireAndForgetSelfDestructs)
 
     // Launch multiple fire-and-forget coroutines
     for (int i = 0; i < 10; ++i) {
-        auto name = std::string("faf_") + std::to_string(i);
-        [&, name]() -> FireAndForget {
-            co_await coExec(pool, "coro_faf", name);
-            completionCount.fetch_add(1);
-        }();
+        insertAndCount(pool, "faf_" + std::to_string(i), completionCount);
     }
 
     // Wait for all to complete

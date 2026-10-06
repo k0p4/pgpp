@@ -112,7 +112,7 @@ def main():
     # cmake
     if not shutil.which("cmake"):
         log("  ERROR: cmake not found in PATH.")
-        log("  Install CMake 3.16+ and ensure it's in your PATH.")
+        log("  Install CMake 3.20+ and ensure it's in your PATH.")
         return 1
     log("  cmake: OK")
 

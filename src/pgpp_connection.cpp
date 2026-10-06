@@ -30,12 +30,12 @@ PgppConnection::~PgppConnection()
     close();
 }
 
-void PgppConnection::reset()
+void PgppConnection::reset() noexcept
 {
     if (m_connection) PQreset(m_connection);
 }
 
-void PgppConnection::close()
+void PgppConnection::close() noexcept
 {
     if (m_connection) {
         PQfinish(m_connection);
@@ -43,18 +43,25 @@ void PgppConnection::close()
     }
 }
 
-bool PgppConnection::isOpen() const
+bool PgppConnection::isOpen() const noexcept
 {
     return m_connection != nullptr && PQstatus(m_connection) == CONNECTION_OK;
 }
 
-std::string PgppConnection::lastError() const
+std::string PgppConnection::lastError() const noexcept
 {
-    if (m_connection) return PQerrorMessage(m_connection);
-    return "";
+    try {
+        if (m_connection) {
+            return PQerrorMessage(m_connection);
+        } else {
+            return "";
+        }
+    } catch (...) {
+        return "";   // the message could not be copied; nothing else to report
+    }
 }
 
-bool PgppConnection::open(const std::string& connectionInfo)
+bool PgppConnection::open(const std::string& connectionInfo) noexcept
 {
     PGPP_LOGV << __func__;
     if (isOpen()) return true;
@@ -69,19 +76,18 @@ bool PgppConnection::open(const std::string& connectionInfo)
     return true;
 }
 
-bool PgppConnection::prepare(const Statement& statement)
+bool PgppConnection::prepare(const Statement& statement) noexcept
 {
     PGPP_LOGV << __func__ << statement.statementName.c_str();
     if (!isOpen()) { PGPP_LOGE << "Connection is not open!"; return false; }
 
-    std::vector<Oid> oids;
-    for (auto& var : statement.variables) oids.push_back(var);
-
+    // Statement::variables holds the OIDs in libpq's own type: no copy, no allocation.
+    static_assert(sizeof(Oid) == sizeof(uint32_t) && std::is_unsigned_v<Oid>);
     auto result = PQprepare(m_connection,
                             statement.statementName.c_str(),
                             statement.statement.c_str(),
-                            statement.variables.size(),
-                            oids.data());
+                            static_cast<int>(statement.variables.size()),
+                            reinterpret_cast<const Oid*>(statement.variables.data()));
     if (!result) {
         PGPP_LOGE << "Unable to prepare statement " << statement.statementName << "!";
         return false;
@@ -95,7 +101,7 @@ bool PgppConnection::prepare(const Statement& statement)
     return true;
 }
 
-bool PgppConnection::isPrepared(const std::string& statementName)
+bool PgppConnection::isPrepared(const std::string& statementName) noexcept
 {
     if (!isOpen()) return false;
     PGresult* queryResult = PQdescribePrepared(m_connection, statementName.c_str());
@@ -105,7 +111,7 @@ bool PgppConnection::isPrepared(const std::string& statementName)
     return result;
 }
 
-bool PgppConnection::execRaw(const std::string& sql)
+bool PgppConnection::execRaw(const std::string& sql) noexcept
 {
     if (!isOpen()) { PGPP_LOGE << "execRaw: connection is not open!"; return false; }
     PGresult* result = PQexec(m_connection, sql.c_str());
@@ -115,8 +121,20 @@ bool PgppConnection::execRaw(const std::string& sql)
     return (status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK);
 }
 
-void PgppConnection::logTemplateError(const std::string& statement, int status)
+void PgppConnection::logTemplateError(const std::string& statement, int status) noexcept
 {
     PGPP_LOGE << "Unable to execute query for " << statement << "! Status:" << status;
     PGPP_LOGE << lastError();
+}
+
+void PgppConnection::logColumnCountError(const std::string& statement, int columns, int requested) noexcept
+{
+    PGPP_LOGE << "Result of " << statement << " has " << columns << " column(s), but "
+              << requested << " were requested";
+}
+
+void PgppConnection::logConversionError(const std::string& statement, int row) noexcept
+{
+    PGPP_LOGE << "Unable to decode result of " << statement << " at row " << row
+              << ": column type does not match the requested C++ type, or the value does not fit";
 }
