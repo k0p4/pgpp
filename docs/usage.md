@@ -84,17 +84,29 @@ auto f = db.execRawAsync("VACUUM ANALYZE account");
 
 ## Transactions
 
-Auto-commits on success, auto-rollbacks on exception:
+`transaction` runs `BEGIN`, calls `work(conn)` on the worker thread, then `COMMIT`. The future
+resolves `true` only if PostgreSQL actually committed. It resolves `false`, after a `ROLLBACK`, when:
+
+- any statement inside `work` failed: PostgreSQL then leaves the transaction *aborted*, and a
+  `COMMIT` on an aborted transaction silently answers `ROLLBACK`, so the pool checks the
+  transaction state itself instead of trusting `COMMIT`;
+- `work` returns `false` (the explicit, non-throwing way to abort);
+- `work` throws.
+
+`work` may return `void` or `bool`. Statement results inside `work` are plain `bool`s, so the
+natural form is to chain them:
 
 ```cpp
 auto f = db.transaction([&](PgppConnection& conn) {
-    conn.execRaw("UPDATE wallet SET balance = balance - 100 WHERE user_id = '1'");
-    conn.execRaw("UPDATE wallet SET balance = balance + 100 WHERE user_id = '2'");
-    // exception here → automatic ROLLBACK
+    return conn.execRaw("UPDATE wallet SET balance = balance - 100 WHERE user_id = '1'")
+        && conn.execRaw("UPDATE wallet SET balance = balance + 100 WHERE user_id = '2'");
 });
 
-bool committed = f.get().value_or(false);
+bool committed = f.get().value_or(false);   // nullopt only when the pool is shutting down
 ```
+
+A `void` work is equivalent to one that always returns `true`: it still rolls back if a
+statement failed, it just cannot abort on its own without throwing.
 
 ## Statement Preparation
 

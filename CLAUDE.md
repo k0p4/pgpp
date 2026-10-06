@@ -82,7 +82,7 @@ Connection pool with worker-thread-per-connection model. Main entry point for ap
 - `execSync` / `querySync` -- blocking convenience wrappers
 - `execAsync` / `queryAsync` -- return `std::future`
 - `exec` / `query` -- callback-based, fires on worker thread
-- `transaction(work)` -- auto BEGIN/COMMIT/ROLLBACK
+- `transaction(work)` -- BEGIN, `work(conn)` (returns void or bool), COMMIT; ROLLBACK and `false` if a statement failed, `work` returned false or threw
 - `execRawSync` / `execRawAsync` -- non-prepared SQL
 
 ### PgppConnection (NOT thread-safe)
