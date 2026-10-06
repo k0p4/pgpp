@@ -12,7 +12,9 @@ set(COMMON_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/common)
 file(GLOB_RECURSE UNIT_TEST_SOURCES CONFIGURE_DEPENDS unit/*.cpp)
 
 add_executable(pgpp_unit_tests ${UNIT_TEST_SOURCES})
-target_link_libraries(pgpp_unit_tests PRIVATE pgpp GTest::gtest_main)
+target_link_libraries(pgpp_unit_tests PRIVATE pgpp::pgpp GTest::gtest_main)
+# The headers are compiled here too: same warnings as the library.
+target_compile_options(pgpp_unit_tests PRIVATE ${PGPP_WARNING_OPTIONS})
 
 add_test(NAME pgpp_unit_tests COMMAND pgpp_unit_tests)
 
@@ -21,6 +23,7 @@ file(GLOB_RECURSE INTEGRATION_TEST_SOURCES CONFIGURE_DEPENDS integration/*.cpp)
 
 add_executable(pgpp_integration_tests ${INTEGRATION_TEST_SOURCES})
 target_include_directories(pgpp_integration_tests PRIVATE ${COMMON_INCLUDE_DIR})
-target_link_libraries(pgpp_integration_tests PRIVATE pgpp GTest::gtest)
+target_link_libraries(pgpp_integration_tests PRIVATE pgpp::pgpp GTest::gtest)
+target_compile_options(pgpp_integration_tests PRIVATE ${PGPP_WARNING_OPTIONS})
 
 add_test(NAME pgpp_integration_tests COMMAND pgpp_integration_tests)

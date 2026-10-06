@@ -159,9 +159,11 @@ TEST(PoolStress, CallbackInFlightAtShutdown)
         });
     }
 
-    // Shut down while the queue is still building out. shutdown() from a
-    // non-executor thread is synchronous (REQ-PGPP-070): when it returns, every
-    // callback has fired.
+    // Let the first statement complete, then shut down while the queue is
+    // still full. shutdown() from a non-executor thread is synchronous
+    // (REQ-PGPP-070): when it returns, every callback has fired.
+    for (int i = 0; i < 500 && fired.load() == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     pool->shutdown();
 
     EXPECT_EQ(fired.load(), kCallbacks)
@@ -170,12 +172,16 @@ TEST(PoolStress, CallbackInFlightAtShutdown)
         << "some callbacks must come through the shutdown-drain path "
            "(test design — with pool size 1 + 20 queued, most get drained)";
     EXPECT_EQ(withValue.load() + drained.load(), kCallbacks);
-    // A callback that reached a worker must have run the statement: "cb_sleep"
-    // was registered right after initialize(), which used to be lost by workers
-    // that had not started yet (see PrepareStatementRightAfterInitialize).
-    EXPECT_EQ(withTrue.load(), withValue.load())
-        << "callbacks served by a worker must succeed, not fail with "
+    // A callback that reached an executor thread must have run the statement:
+    // "cb_sleep" was registered right after initialize(), which used to be lost
+    // by workers that had not started yet (see PrepareStatementRightAfterInitialize).
+    // The one statement in flight when shutdown() arrived is cancelled
+    // (REQ-PGPP-076) and reports false; with one connection that is at most one.
+    EXPECT_GE(withTrue.load(), 1)
+        << "callbacks served before shutdown must succeed, not fail with "
            "'prepared statement does not exist'";
+    EXPECT_LE(withValue.load() - withTrue.load(), 1)
+        << "only the statement cancelled by shutdown() may report false";
 }
 
 // ============================================================================

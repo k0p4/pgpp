@@ -42,7 +42,7 @@ jobs:
 
       - name: Build
         run: |
-          cmake -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -DPGPP_BUILD_TESTS=ON -G "Unix Makefiles" -B build
+          cmake -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -DPGPP_BUILD_TESTS=ON -DPGPP_WARNINGS_AS_ERRORS=ON -G "Unix Makefiles" -B build
           cmake --build build --config ${{matrix.build_type}} -j $(nproc)
 
       - name: "Unit tests"
@@ -87,7 +87,7 @@ jobs:
 
       - name: Build
         run: |
-          cmake -DCMAKE_BUILD_TYPE=Debug -DPGPP_BUILD_TESTS=ON \
+          cmake -DCMAKE_BUILD_TYPE=Debug -DPGPP_BUILD_TESTS=ON -DPGPP_WARNINGS_AS_ERRORS=ON \
                 -DCMAKE_CXX_FLAGS=-fsanitize=thread -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread \
                 -G "Unix Makefiles" -B build
           cmake --build build -j $(nproc)
@@ -109,6 +109,97 @@ jobs:
         if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         with:
           name: "Tests / ThreadSanitizer"
+          path: test-results/*.xml
+          reporter: java-junit
+          fail-on-empty: false
+
+
+  AddressSanitizer:
+    # Memory errors, leaks and undefined behaviour: the whole suite under
+    # ASan + UBSan, failing on the first report.
+    permissions:
+      checks: write
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: "Install dependencies"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpq-dev
+
+      - uses: actions/checkout@v6
+
+      - name: Build
+        run: |
+          cmake -DCMAKE_BUILD_TYPE=Debug -DPGPP_BUILD_TESTS=ON -DPGPP_WARNINGS_AS_ERRORS=ON \
+                "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-omit-frame-pointer" \
+                "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined" \
+                -G "Unix Makefiles" -B build
+          cmake --build build -j $(nproc)
+
+      - name: "Unit tests"
+        env:
+          ASAN_OPTIONS: "detect_leaks=1"
+          UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
+          GTEST_OUTPUT: xml:${{github.workspace}}/test-results/unit-tests.xml
+        run: ctest --test-dir build --output-on-failure -R pgpp_unit_tests
+
+      - name: "Integration tests"
+        env:
+          ASAN_OPTIONS: "detect_leaks=1"
+          UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
+          GTEST_OUTPUT: xml:${{github.workspace}}/test-results/integration-tests.xml
+        run: ctest --test-dir build --output-on-failure -R pgpp_integration_tests
+
+      - name: "Test report"
+        uses: dorny/test-reporter@v3
+        if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        with:
+          name: "Tests / AddressSanitizer"
+          path: test-results/*.xml
+          reporter: java-junit
+          fail-on-empty: false
+
+
+  PostgreSQL-Versions:
+    # The supported server range (REQ-PGPP-056); 16 is what every other job runs.
+    permissions:
+      checks: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [13, 14, 15, 17]
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: "Install dependencies"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpq-dev
+
+      - uses: actions/checkout@v6
+
+      - name: Build
+        run: |
+          cmake -DCMAKE_BUILD_TYPE=Release -DPGPP_BUILD_TESTS=ON -G "Unix Makefiles" -B build
+          cmake --build build -j $(nproc)
+
+      - name: "Integration tests"
+        env:
+          PGPP_TEST_PG_IMAGE: "postgres:${{matrix.pg}}-alpine"
+          GTEST_OUTPUT: xml:${{github.workspace}}/test-results/integration-tests.xml
+        run: ctest --test-dir build --output-on-failure -R pgpp_integration_tests
+
+      - name: "Test report"
+        uses: dorny/test-reporter@v3
+        if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        with:
+          name: "Tests / PostgreSQL ${{matrix.pg}}"
           path: test-results/*.xml
           reporter: java-junit
           fail-on-empty: false
@@ -139,6 +230,21 @@ jobs:
         env:
           GTEST_OUTPUT: xml:${{github.workspace}}/test-results/unit-tests.xml
         run: ctest --test-dir build -C ${{matrix.build_type}} --output-on-failure -R pgpp_unit_tests
+
+      - name: "Setup PostgreSQL"
+        uses: ikalnytskyi/action-setup-postgres@v8
+        with:
+          postgres-version: "16"
+          username: postgres
+          password: pgpp_test_pass
+          database: pgpp_test
+          port: 15432
+
+      - name: "Integration tests"
+        env:
+          PGPP_SKIP_DOCKER: "1"
+          GTEST_OUTPUT: xml:${{github.workspace}}/test-results/integration-tests.xml
+        run: ctest --test-dir build -C ${{matrix.build_type}} --output-on-failure -R pgpp_integration_tests
 
       - name: "Test report"
         uses: dorny/test-reporter@v3
@@ -171,7 +277,7 @@ jobs:
 
       - name: Build
         run: |
-          cmake -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -DPGPP_BUILD_TESTS=ON -DCMAKE_PREFIX_PATH="$(brew --prefix libpq)" -G "Unix Makefiles" -B build
+          cmake -DCMAKE_BUILD_TYPE=${{matrix.build_type}} -DPGPP_BUILD_TESTS=ON -DPGPP_WARNINGS_AS_ERRORS=ON -DCMAKE_PREFIX_PATH="$(brew --prefix libpq)" -G "Unix Makefiles" -B build
           cmake --build build --config ${{matrix.build_type}} -j $(sysctl -n hw.ncpu)
 
       - name: "Unit tests"
@@ -228,11 +334,13 @@ jobs:
       - name: "Build for analysis"
         # Name the versioned binaries: the runner's /usr/bin/clang++ is clang 18,
         # which cannot see libstdc++'s <expected>. The analyzers are pinned the
-        # same way through CC_ANALYZER_BIN below.
+        # same way through CC_ANALYZER_BIN below. The tests are built too, so
+        # the headers are analysed as instantiated by real callers.
         run: |
           cmake \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
             -DCMAKE_BUILD_TYPE=Debug \
+            -DPGPP_BUILD_TESTS=ON \
             -DCMAKE_C_COMPILER=clang-20 \
             -DCMAKE_CXX_COMPILER=clang++-20 \
             -G "Unix Makefiles" \

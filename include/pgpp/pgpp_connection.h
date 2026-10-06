@@ -446,17 +446,17 @@ bool PgppConnection::execPrepared(const std::string& statement, std::vector<std:
         return false;
     }
 
-    constexpr int columns = sizeof...(TAs);
-    if (PQnfields(queryResult.get()) < columns) [[unlikely]] {
-        logColumnCountError(statement, PQnfields(queryResult.get()), columns);
+    constexpr size_t columns = sizeof...(TAs);
+    if (PQnfields(queryResult.get()) < static_cast<int>(columns)) [[unlikely]] {
+        logColumnCountError(statement, PQnfields(queryResult.get()), static_cast<int>(columns));
         return false;
     }
 
     // std::array, not a C array: `std::tuple<>` makes `columns` 0, and a
     // zero-length C array is ill-formed (MSVC C2466).
     std::array<Oid, columns> types{};
-    for (int col = 0; col < columns; col++) {
-        types[static_cast<size_t>(col)] = PQftype(queryResult.get(), col);
+    for (size_t col = 0; col < columns; col++) {
+        types[col] = PQftype(queryResult.get(), static_cast<int>(col));
     }
 
     const auto initialSize = result.size();

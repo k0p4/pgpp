@@ -103,7 +103,7 @@ TEST_F(PgppIntegrationTest, PoolCallbackOnWorkerThread)
     std::promise<void> done;
 
     pool.exec("cb_ins",
-        [&callbackThread, &done](std::optional<bool> ok) {
+        [&callbackThread, &done](std::optional<bool>) {
             callbackThread.store(std::this_thread::get_id());
             done.set_value();
         },

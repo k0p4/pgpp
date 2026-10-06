@@ -6,8 +6,8 @@
 
 pgpp is a thread-safe PostgreSQL connection pool library built on libpq. It provides
 synchronous, future-based, callback-based, and coroutine-based interfaces for executing
-prepared statements and raw SQL. Each pool connection runs on a dedicated worker thread
-with automatic reconnection on connection loss.
+prepared statements and raw SQL. Connections live on a free-list and are handed out as leases;
+a small executor runs the asynchronous APIs. Lost connections are restored automatically.
 
 **License:** GPL-3.0-or-later
 
@@ -23,17 +23,23 @@ Configuration struct for database connection parameters.
 |---|---|---|---|
 | `dbname` | `std::string` | `""` | Database name (required) |
 | `host` | `std::string` | `""` | Server hostname |
-| `sslmode` | `std::string` | `""` | SSL mode (disable, allow, prefer, require, etc.) |
-| `options` | `std::string` | `""` | Additional libpq options |
+| `sslmode` | `std::string` | `""` | SSL mode (disable, allow, prefer, require, verify-ca, verify-full). Empty = libpq's default, `prefer`: encrypted if the server offers it, server identity not verified. Production deployments should set `verify-full` and pass `sslrootcert` through `libpqParams`. |
+| `options` | `std::string` | `""` | Server command-line options, e.g. `-c statement_timeout=5000` |
 | `user` | `std::string` | `""` | Database user |
-| `password` | `std::string` | `""` | User password |
+| `password` | `std::string` | `""` | User password. Used to connect and not kept by the pool afterwards. |
 | `port` | `uint16_t` | `5432` | Server port |
+| `connectTimeoutSeconds` | `int` | `0` | `connect_timeout`; 0 = libpq's default (no limit) |
+| `libpqParams` | `std::string` | `""` | Any further libpq keywords, verbatim (`sslrootcert='...' channel_binding=require`). Appended last, so it can override the fields above. |
+| `acquireTimeout` | `std::chrono::milliseconds` | 30000 | How long `acquire()` and the synchronous API wait for a free connection; 0 = no limit |
+| `maxQueuedRequests` | `size_t` | `0` | Upper bound on requests waiting for an executor thread; 0 = unbounded |
+| `resetSessionAfterRequest` | `bool` | `false` | Reset the session every time a connection is returned (REQ-PGPP-080) |
 
 **Requirements:**
 
 - **REQ-PGPP-001:** `dbname` must be non-empty; `buildConnectionString` returns empty string if `dbname` is empty.
 - **REQ-PGPP-002:** Special characters in field values (`'` and `\`) must be escaped in the connection string using backslash escaping within single-quoted values.
 - **REQ-PGPP-003:** `password` is only included in the connection string if `user` is also non-empty.
+- **REQ-PGPP-077:** `connectTimeoutSeconds > 0` is emitted as `connect_timeout=N`. `libpqParams` is appended verbatim and last; libpq takes the last occurrence of a keyword, so a keyword given there overrides the generated one. `PgppPool::buildConnectionString` is a public static function (the only way to see the string the pool uses; it contains the password).
 
 ### 1.2 Statement
 
@@ -122,12 +128,14 @@ order, booleans as one byte, textual types as the raw text. Nothing is parsed fr
 | any integral type (`int`, `int16_t`, `int64_t`, `uint32_t`, ...) except `bool` | `int2`, `int4`, `int8`, `oid` | widened to 64 bits, then range-checked against `T` with `std::in_range`: 40000 into `int16_t`, or -1 / 5000000000 into `uint32_t`, is `OutOfRange`, never a silent wrap. |
 | `double`, `float` | `float4`, `float8`, and the integer types above | `float8` into `float` is `OutOfRange` when finite and above `FLT_MAX`; infinities and NaN pass through. |
 | `bool` | `boolean` | one byte, non-zero is `true`. |
+| `std::optional<T>` for any `T` above | as `T` | a non-NULL cell decodes as `T` (same errors); a NULL cell is `nullopt`. |
 
 `numeric` has no decoder: select it as `::int8` or `::float8`. NULL cells never reach a decoder.
 
 **Requirements:**
 
-- **REQ-PGPP-008:** NULL values (detected via `PQgetisnull`) must leave the target at its default-constructed value; the decoder is never called for NULL fields.
+- **REQ-PGPP-008:** NULL values (detected via `PQgetisnull`) must leave the target at its default-constructed value (`""`, `0`, `false`, or `nullopt` for a `std::optional` column); the decoder is never called for NULL fields.
+- **REQ-PGPP-075:** A result column of type `std::optional<T>` makes NULL distinguishable: NULL reads as `nullopt`, anything else as `T` with `T`'s decoding rules. A parameter of type `std::optional<std::string>` (or `std::optional` of any string-like type) is sent as SQL NULL when empty, as its value otherwise.
 - **REQ-PGPP-009:** A decoder must accept exactly the column types listed above for its C++ type and reject every other column type with `TypeMismatch`; it must verify the cell size of fixed-width types and report `Malformed` otherwise.
 - **REQ-PGPP-057:** A cell that cannot be decoded (`TypeMismatch`, `OutOfRange` or `Malformed`) fails the whole query: `fillTupleFromPQValues` returns `false` at the first failing column, and the result overload of `execPrepared` logs the row via `logConversionError`, removes any rows it already appended, and returns `false`. No partial result and no exception ever reaches callers, futures, callbacks, or coroutines.
 
@@ -173,13 +181,18 @@ Single-connection wrapper around a `PGconn*`. NOT thread-safe.
 | Method | Signature | Description |
 |---|---|---|
 | `execRaw` | `bool execRaw(const std::string& sql)` | Executes raw SQL via `PQexec`. Returns `true` if status is `PGRES_COMMAND_OK` or `PGRES_TUPLES_OK`. |
-| `execPrepared` (no results) | `template<typename... Ts> bool execPrepared(name, args...)` | Executes a prepared statement expecting `PGRES_COMMAND_OK` (INSERT, UPDATE, DELETE). All args must have `.c_str()`. |
+| `execPrepared` (no results) | `template<typename... Ts> bool execPrepared(name, args...)` | Executes a prepared statement and discards whatever it returns: `true` on `PGRES_COMMAND_OK` (INSERT, UPDATE, DELETE) or `PGRES_TUPLES_OK` (SELECT, `INSERT ... RETURNING`), REQ-PGPP-073. |
 | `execPrepared` (with results) | `template<typename... Ts, typename... TAs> bool execPrepared(name, vector<tuple<TAs...>>&, args...)` | Executes a prepared statement expecting `PGRES_TUPLES_OK` (SELECT) with binary results (REQ-PGPP-062). Looks up each column's type OID once, checks the column count (REQ-PGPP-063), then appends rows to the result vector; on a decoding failure appends nothing and returns `false` (REQ-PGPP-057). |
+
+Arguments are `std::string` (anything with `.c_str()` and `.size()`), or `std::optional` of one
+(REQ-PGPP-075).
 
 **Requirements:**
 
 - **REQ-PGPP-015:** `execRaw` must return `false` if the connection is not open.
-- **REQ-PGPP-016:** `execPrepared` passes all arguments as text-format strings via `.c_str()`.
+- **REQ-PGPP-016:** `execPrepared` passes all arguments as text-format strings (`Internal::Details::paramValue`: `.c_str()`, or `nullptr` for an empty `std::optional`, which libpq sends as NULL).
+- **REQ-PGPP-073:** The no-result overload treats `PGRES_TUPLES_OK` as success: a statement that returns rows through `execSync`, `execAsync`, `exec` or `coExec` ran, and its rows are dropped. Every other status is a failure.
+- **REQ-PGPP-074:** A text parameter whose length differs from `strlen(c_str())`, i.e. one with an embedded NUL, is refused by both overloads before anything is sent: `false`, logged via `logParamError`. Text cannot carry a NUL and silently truncating at it would change the query (CWE-158).
 - **REQ-PGPP-017:** The result overload of `execPrepared` must append to (not replace) the result vector, using `reserve` for efficiency.
 - **REQ-PGPP-018:** Failed executions must log the error via `logTemplateError`.
 - **REQ-PGPP-062:** The result overload of `execPrepared` requests binary results (`PQexecPrepared` result format 1). Parameters remain text (REQ-PGPP-016). Column types are read with `PQftype` once per result and passed to the decoders.
@@ -197,10 +210,10 @@ APIs. No thread owns a connection; whoever holds a lease uses it on their own th
 
 | Method | Signature | Description |
 |---|---|---|
-| Constructor | `PgppPool()` | Sets `m_poolSize` to `hardware_concurrency()` (falls back to 16 if 0) |
+| Constructor | `PgppPool()` | Sets the default pool size to `min(hardware_concurrency(), 8)`, or 8 when the core count is unknown (REQ-PGPP-079) |
 | Destructor | `~PgppPool()` | Calls `shutdown()` |
-| `initialize` | `bool initialize(const PgppConnectionInfo&, size_t poolSize=0)` | Builds the connection string, opens `poolSize` connections, prepares the registered statements on each, starts `poolSize` executor threads. If `poolSize > 0`, overrides the default. |
-| `shutdown` | `void shutdown()` | Stops accepting work, lets the executor drain pending requests (each completes with `nullopt`), joins the executor threads, waits for outstanding leases, closes the connections. From an executor thread (inside a callback, transaction work or a resumed coroutine): stops and returns without waiting (REQ-PGPP-070). |
+| `initialize` | `bool initialize(const PgppConnectionInfo&, size_t poolSize=0)` | Builds the connection string, opens `poolSize` connections, prepares the registered statements on each, starts `poolSize` executor threads, stores `acquireTimeout` and `maxQueuedRequests`. If `poolSize > 0`, overrides the default. |
+| `shutdown` | `void shutdown()` | Stops accepting work, cancels the statement in flight on every leased connection (REQ-PGPP-076), lets the executor drain pending requests (each completes with `nullopt`), joins the executor threads, waits for outstanding leases, closes the connections. From an executor thread (inside a callback, transaction work or a resumed coroutine): stops, cancels and returns without waiting (REQ-PGPP-070). |
 | `isInitialized` | `bool isInitialized() const noexcept` | Atomic check |
 
 **Requirements:**
@@ -214,12 +227,14 @@ APIs. No thread owns a connection; whoever holds a lease uses it on their own th
 - **REQ-PGPP-060:** `shutdown()` must never hang, however soon after `initialize()` it is called. Every wait in the pool (`acquire`, the executor's wait for a task, the wait for leases) has the stop flag in its predicate, and every flag is set under the mutex its waiters use, so no wake-up can be lost.
 - **REQ-PGPP-070:** A thread cannot join itself. `shutdown()` called on an executor thread marks the pool uninitialized (new requests are refused), sets the stop flags, wakes everyone and returns at once. The executor threads drain the queue (REQ-PGPP-021) and exit on their own; a leased connection is closed when its lease is returned; the next `shutdown()` or `initialize()` from a non-executor thread joins the threads and closes what is left. `shutdown()` from a non-executor thread is synchronous: when it returns, no executor thread runs, every pending request is resolved, every lease has been returned and every connection is closed. Destroying the pool from an executor thread is forbidden (the destructor cannot wait for the thread it runs on).
 - **REQ-PGPP-071:** `initialize()` and `shutdown()` from non-executor threads are serialised by `m_lifecycleMutex`; two threads calling them concurrently leave the pool either fully initialized with exactly `poolSize` connections or fully shut down, never a mixture. Executor threads never take this mutex (a `shutdown()` that is joining them may hold it): on an executor thread `initialize()` reports the current state and `shutdown()` follows REQ-PGPP-070.
+- **REQ-PGPP-076:** `shutdown()` does not wait for a running statement. After the stop flags are set it sends a cancel request (`PQcancel`, from a `PGcancel` handle kept per connection under `m_mutex` and refreshed after every reconnect) to every leased connection, whether leased by an executor task or by a caller's `acquire()`. The cancelled statement fails with PostgreSQL's "canceling statement due to user request" and the request reports `false` (not `nullopt`: it was executed). A connection idle under its lease is unaffected.
+- **REQ-PGPP-079:** The default pool size is one connection per hardware thread, capped at 8, and 8 when `hardware_concurrency()` is 0. The database server's connection limit, not the client's core count, is the scarce resource; larger pools are an explicit choice through `poolSize`.
 
 ### 5.2 Statement Management
 
 | Method | Signature | Description |
 |---|---|---|
-| `prepareStatement` | `void prepareStatement(const Statement&)` | Appends the statement to the registered list. Nothing else: every connection catches up on its next acquisition. |
+| `prepareStatement` | `bool prepareStatement(const Statement&)` | Appends the statement to the registered list and returns `true`; `false` if it could not be stored (allocation), in which case no connection will prepare it. Nothing else: every connection catches up on its next acquisition. |
 
 **Requirements:**
 
@@ -232,7 +247,7 @@ APIs. No thread owns a connection; whoever holds a lease uses it on their own th
 
 | Method | Signature | Description |
 |---|---|---|
-| `acquire` | `Lease acquire()` | Takes a free connection for the calling thread, reconnecting and catching up on statements first (REQ-PGPP-026, 042, 043). Waits up to `PgppConnectionInfo::acquireTimeout` (default 30 s; 0 = no limit). Returns an empty lease if none became free in time, the pool is not running, or the reconnect failed. |
+| `acquire` | `[[nodiscard]] Lease acquire()` | Takes a free connection for the calling thread, reconnecting and catching up on statements first (REQ-PGPP-026, 042, 043). Waits up to `PgppConnectionInfo::acquireTimeout` (default 30 s; 0 = no limit). Returns an empty lease if none became free in time, the pool is not running, or the reconnect failed. |
 | `Lease` | movable RAII handle | `operator bool`, `get()`, `operator->`, `operator*`, `release()`. Returns the connection to the pool on destruction or `release()`. |
 | `execSync` | `template<Ts...> bool execSync(name, args...)` | `acquire()`, `execPrepared`, release. `false` if no lease. |
 | `querySync` | `template<RowTuple, Ts...> pair<bool, vector<RowTuple>> querySync(name, args...)` | Same with the result overload. `{false, {}}` if no lease. |
@@ -304,6 +319,7 @@ is likewise an independent transaction on its own connection.
 
 - **REQ-PGPP-037:** Must hold `m_taskMutex` during the push, then `notify_one`.
 - **REQ-PGPP-038:** Must return `false` (without enqueuing) if the pool is not initialized or the executor is stopping.
+- **REQ-PGPP-078:** With `maxQueuedRequests > 0`, `enqueueRaw` returns `false` when that many requests are already waiting (requests being executed do not count). The caller's API then reports the refusal at once: a future resolved with `nullopt`, a callback fired with `nullopt` on the calling thread, an awaitable completing with `nullopt` (REQ-PGPP-030/033).
 
 ### 5.8 Pool Statistics
 
@@ -361,6 +377,7 @@ acquire(timeout):
 
 release(slot):
     if transaction open or aborted: ROLLBACK, warn                           (REQ-072)
+    if resetSessionAfterRequest: reset the session; on failure reconnect     (REQ-080)
     lock(mutex); leased--; stopping ? close : push idle; unlock; notify_all
 ```
 
@@ -369,7 +386,8 @@ release(slot):
 - **REQ-PGPP-042:** On connection loss, `acquire` must attempt `PQreset` on the caller's thread. If the reset fails, the connection goes back to the free-list and the caller gets an empty lease (`false` / `nullopt`).
 - **REQ-PGPP-043:** After a successful reconnection the connection's prepared count is reset, so every registered statement is prepared again before the lease is handed out.
 - **REQ-PGPP-044:** *Retired.* `busyConnections()` is the leased count under `m_mutex`.
-- **REQ-PGPP-072:** A connection is returned clean. If `PQtransactionStatus` is `PQTRANS_INTRANS` or `PQTRANS_INERROR` when a lease is released (a caller issued `BEGIN` through the raw API and never ended it, or an error aborted a transaction a caller left open), the pool issues `ROLLBACK` and logs a warning before the connection goes back to the free-list. A caller's stray transaction can therefore neither swallow the next caller's writes nor leave the connection unusable. Session settings (`SET`, `SET ROLE`, temporary tables) are *not* reset: connections have no caller affinity, so use `SET LOCAL` inside `transaction()` for per-request settings.
+- **REQ-PGPP-072:** A connection is returned clean. If `PQtransactionStatus` is `PQTRANS_INTRANS` or `PQTRANS_INERROR` when a lease is released (a caller issued `BEGIN` through the raw API and never ended it, or an error aborted a transaction a caller left open), the pool issues `ROLLBACK` and logs a warning before the connection goes back to the free-list. A caller's stray transaction can therefore neither swallow the next caller's writes nor leave the connection unusable. Session settings (`SET`, `SET ROLE`, temporary tables) are *not* reset by default: connections have no caller affinity, so use `SET LOCAL` inside `transaction()` for per-request settings, or enable REQ-PGPP-080.
+- **REQ-PGPP-080:** With `PgppConnectionInfo::resetSessionAfterRequest`, every release additionally runs, in one round trip, `SET SESSION AUTHORIZATION DEFAULT; RESET ALL; CLOSE ALL; UNLISTEN *; SELECT pg_advisory_unlock_all(); DISCARD TEMP; DISCARD SEQUENCES` (what `DISCARD ALL` does minus `DEALLOCATE ALL`, so prepared statements survive, and minus `DISCARD PLANS`). If that fails the connection is reset (new session, statements prepared again on the next acquisition). The cost is one server round trip per request; the default is off.
 
 ---
 
@@ -457,18 +475,21 @@ Macros: `PGPP_LOGV`, `PGPP_LOGD`, `PGPP_LOGW`, `PGPP_LOGE`.
 ## 9. Build System
 
 - CMake 3.20+, C++23 required (`std::expected`). The `pgpp` target declares `cxx_std_23` as a PUBLIC compile feature, so consumers (FetchContent included) inherit the standard without setting it themselves.
-- Static library target: `pgpp`.
-- Public dependency: `PostgreSQL::PostgreSQL` (via `find_package`).
+- Static library target: `pgpp`, also reachable as `pgpp::pgpp`.
+- Public dependencies: `PostgreSQL::PostgreSQL` and `Threads::Threads` (via `find_package`).
 - Optional private dependency: `alog` (auto-detected via CMake target existence).
 - Public include directory: `include/`.
 - Header files: `include/pgpp/pgpp.h`, `include/pgpp/pgpp_connection.h`, `include/pgpp/pgpp_coroutines.h`.
 - Consumed via CMake `FetchContent` by downstream projects.
+- `CMakePresets.json` uses schema version 3 (CMake 3.21+); the presets are for standalone development only, the library itself needs 3.20.
+- Warnings: the library and the tests compile with `-Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion` (`/W4` on MSVC), PRIVATE, so nothing reaches consumers; `-DPGPP_WARNINGS_AS_ERRORS=ON` makes them errors (CI does).
 
 **Requirements:**
 
 - **REQ-PGPP-054:** The library must build without `alog` present (logging becomes no-op).
 - **REQ-PGPP-055:** PostgreSQL client library (libpq) must be found via `find_package(PostgreSQL REQUIRED)`.
-- **REQ-PGPP-056:** The library must support PostgreSQL versions 13 through 17.
+- **REQ-PGPP-056:** The library must support PostgreSQL versions 13 through 17. CI runs the integration suite against each (`PGPP_TEST_PG_IMAGE`).
+- **REQ-PGPP-081:** The `pgpp` target links `Threads::Threads` publicly and carries no test-only compile definitions; the tests use only the public API.
 
 ---
 
@@ -561,3 +582,12 @@ be distinguishable from failure, and `std::expected<T, E>` where the reason matt
 | REQ-PGPP-070 | shutdown(): synchronous from outside, non-blocking from an executor thread; destructor never from one | 5.1 |
 | REQ-PGPP-071 | initialize/shutdown serialised; executor threads never take the lifecycle lock | 5.1 |
 | REQ-PGPP-072 | A connection is returned clean: stray open/aborted transaction rolled back on release | 6.3 |
+| REQ-PGPP-073 | No-result execPrepared accepts a statement that returns rows (rows dropped) | 4.3 |
+| REQ-PGPP-074 | A parameter with an embedded NUL is refused, nothing sent | 4.3 |
+| REQ-PGPP-075 | std::optional result columns (NULL = nullopt) and parameters (nullopt = NULL) | 3 |
+| REQ-PGPP-076 | shutdown() cancels the statement in flight on every leased connection | 5.1 |
+| REQ-PGPP-077 | connect_timeout and verbatim libpq parameters; public static buildConnectionString | 1.1 |
+| REQ-PGPP-078 | Bounded executor queue: excess requests refused at once with nullopt | 5.7 |
+| REQ-PGPP-079 | Default pool size min(cores, 8) | 5.1 |
+| REQ-PGPP-080 | Opt-in session reset on every release | 6.3 |
+| REQ-PGPP-081 | Threads::Threads public, no test-only definitions in the library | 9 |

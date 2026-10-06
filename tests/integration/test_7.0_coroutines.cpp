@@ -140,8 +140,9 @@ TEST_F(PgppIntegrationTest, CoExecFailingQuery)
 
     ASSERT_TRUE(waitFor([&] { return done.load(); })) << "Coroutine with failing query should still complete";
     // Result should indicate failure (false) or no value
-    if (result.has_value())
+    if (result.has_value()) {
         EXPECT_FALSE(result.value());
+    }
 }
 
 // ── co_await on shutdown pool ──────────────────────────────────────────────

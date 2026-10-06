@@ -6,7 +6,7 @@ Testing strategy for the pgpp PostgreSQL connection pool library. Tests are divi
 unit tests (no database required) and integration tests (require a running PostgreSQL instance).
 
 **Framework:** GoogleTest v1.14.0 (fetched via FetchContent)
-**Test totals:** 61 unit + 100 integration = 161 test cases
+**Test totals:** 66 unit + 112 integration = 178 test cases
 
 ---
 
@@ -29,7 +29,7 @@ pool state machine basics. Located in `tests/unit/`, numeric-prefixed for orderi
 |---|---|---|
 | UT-STMT-001 | `StatementHoldsFields` — Statement struct holds name, SQL, variables | REQ-PGPP-004, REQ-PGPP-005 |
 | UT-STMT-002 | `StatementMultipleParams` — Statement with multiple OID parameters | REQ-PGPP-005 |
-| UT-STMT-003 | `PgppConnectionInfoDefaults` — default field values | REQ-PGPP-001 |
+| UT-STMT-003 | `PgppConnectionInfoDefaults` — default field values, including the pool/connection options | REQ-PGPP-001, REQ-PGPP-077, REQ-PGPP-078, REQ-PGPP-080 |
 | UT-OID-001 | `MatchPostgreSQLCatalog` — pg:: OID constants match documented values | REQ-PGPP-006 |
 
 ### test_2.0_conversions.cpp — Binary Result Decoding
@@ -60,10 +60,12 @@ Tests `Internal::Details::decodeBinary<T>(oid, bytes)` on hand-built wire-format
 | UT-CONV-020 | `StringUtf8Multibyte` | REQ-PGPP-009 |
 | UT-CONV-021 | `TextualTypeSet` — `isTextualType` over the pg:: catalog | REQ-PGPP-009 |
 | UT-CONV-022 | `EmptyRowTupleInstantiates` — `std::vector<std::tuple<>>` result compiles (zero columns, no zero-length array) and fails cleanly on a closed connection | REQ-PGPP-063 |
+| UT-CONV-023 | `OptionalWrapsTheInnerDecoder` — `std::optional<T>` decodes as `T`; every error passed through | REQ-PGPP-075 |
+| UT-CONV-024 | `ParameterPointersAndEmbeddedNul` — `paramValue` (nullopt → nullptr), `paramHasEmbeddedNul` | REQ-PGPP-074, REQ-PGPP-075 |
 
 ### test_2.1_connection_string.cpp — Connection String Builder
 
-Uses `PgppPoolTest` fixture (friend access to `buildConnectionString`).
+Calls the public static `PgppPool::buildConnectionString`.
 
 | ID | Test | Requirement |
 |---|---|---|
@@ -81,6 +83,9 @@ Uses `PgppPoolTest` fixture (friend access to `buildConnectionString`).
 | UT-CONN-012 | `BuildConnectionStringPortMin` — port=1 | REQ-PGPP-001 |
 | UT-CONN-013 | `BuildConnectionStringMinimalFields` — dbname only | REQ-PGPP-001 |
 | UT-CONN-014 | `BuildConnectionStringUnicodeDbname` | REQ-PGPP-002 |
+| UT-CONN-015 | `BuildConnectionStringConnectTimeout` — `connect_timeout=N` | REQ-PGPP-077 |
+| UT-CONN-016 | `BuildConnectionStringLibpqParamsAppendedLast` — verbatim, after the generated keywords | REQ-PGPP-077 |
+| UT-CONN-017 | `BuildConnectionStringIsNoexceptStatic` | REQ-PGPP-061, REQ-PGPP-077 |
 
 ### test_3.0_pool_state.cpp — Pool State Machine
 
@@ -93,10 +98,10 @@ Uses `PgppPoolTest` fixture (friend access to `buildConnectionString`).
 | UT-POOL-005 | `ShutdownThenReinitialize` | REQ-PGPP-020, REQ-PGPP-019 |
 | UT-POOL-006 | `EnqueueRawOnUninitializedPool` | REQ-PGPP-038 |
 | UT-POOL-007 | `AsyncOnUninitializedPoolReturnsNullopt` | REQ-PGPP-029 |
-| UT-POOL-008 | `PrepareStatementBeforeInitialize` | REQ-PGPP-025 |
+| UT-POOL-008 | `PrepareStatementBeforeInitialize` — returns `true` (registered) | REQ-PGPP-025 |
 | UT-POOL-009 | `PrepareStatementEmptyName` | REQ-PGPP-004 |
-| UT-POOL-010 | `CallbackExecOnUninitializedPool` | REQ-PGPP-033 |
-| UT-POOL-011 | `TransactionOnUninitializedPool` | REQ-PGPP-034 |
+| UT-POOL-010 | `CallbackExecOnUninitializedPool` — `exec` and `query` fire once, with `nullopt`, on the calling thread, before returning | REQ-PGPP-033 |
+| UT-POOL-011 | `TransactionOnUninitializedPool` — future resolved with `nullopt` (request refused) | REQ-PGPP-029, REQ-PGPP-038 |
 
 ### test_4.0_noexcept.cpp — The Library Never Throws
 
@@ -106,7 +111,7 @@ failure value instead of propagating.
 
 | ID | Test | Requirement |
 |---|---|---|
-| UT-NOEXC-001 | `PublicApiIsNoexcept` — `static_assert(noexcept(...))` over the public API | REQ-PGPP-061 |
+| UT-NOEXC-001 | `PublicApiIsNoexcept` — `static_assert(noexcept(...))` over the public API, `std::optional` parameters and columns included | REQ-PGPP-061 |
 | UT-NOEXC-002 | `ExecAsyncArgumentCopyFailureYieldsNullopt` | REQ-PGPP-061, REQ-PGPP-029a |
 | UT-NOEXC-003 | `QueryAsyncArgumentCopyFailureYieldsNullopt` | REQ-PGPP-061, REQ-PGPP-029a |
 | UT-NOEXC-004 | `SyncArgumentCopyFailureReturnsFalse` — execSync / querySync | REQ-PGPP-061 |
@@ -175,6 +180,8 @@ Fixture: `PgppConnectionTest`
 | IT-EXEC-011 | `ExecPreparedIntBoundaryValues` | REQ-PGPP-009 |
 | IT-EXEC-012 | `ExecPreparedFloatPrecision` | REQ-PGPP-009 |
 | IT-EXEC-013 | `ExecPreparedZeroRows` | REQ-PGPP-017 |
+| IT-EXEC-014 | `ExecPreparedNoResultAcceptsRows` — `INSERT ... RETURNING` and `SELECT` through the no-result overload succeed; a real failure still fails | REQ-PGPP-073 |
+| IT-EXEC-015 | `ExecPreparedOptionalColumnsAndParams` — NULL reads as `nullopt`, `nullopt` inserts NULL, plain columns keep the default, decoding errors still reported | REQ-PGPP-075, REQ-PGPP-008 |
 
 ### test_3.1_conversion_errors.cpp — Result Conversion Failures
 
@@ -206,17 +213,22 @@ Fixture: `PgppIntegrationTest` (+ standalone tests for shutdown scenarios)
 | IT-POOL-007 | `PoolCallbackOnWorkerThread` | REQ-PGPP-032 |
 | IT-POOL-008 | `PoolConcurrentQueries` | REQ-PGPP-027, REQ-PGPP-044 |
 | IT-POOL-009 | `PoolStatisticsIdle` | REQ-PGPP-039, REQ-PGPP-040 |
-| IT-POOL-010 | `PoolStatisticsUnderLoad` | REQ-PGPP-039, REQ-PGPP-040 |
-| IT-POOL-011 | `PoolPrepareOnRunningPool` | REQ-PGPP-026 |
+| IT-POOL-010 | `PoolStatisticsUnderLoad` — polls until both connections are leased | REQ-PGPP-039, REQ-PGPP-040 |
+| IT-POOL-011 | `PoolPrepareOnRunningPool` — usable by the very next request, no waiting | REQ-PGPP-026 |
 | IT-POOL-012 | `PoolQueryCallback` | REQ-PGPP-032 |
 | IT-POOL-013 | `DuplicatePrepareStatementHandled` | REQ-PGPP-004 |
 | IT-POOL-014 | `PoolExecZeroArgs` | REQ-PGPP-016 |
 | IT-POOL-015 | `QueueSaturation` | REQ-PGPP-037, REQ-PGPP-040 |
 | IT-POOL-016 | `WorkerRecoveryAfterBadQuery` | REQ-PGPP-041 |
 | IT-POOL-017 | `PoolQueryReturningZeroRows` | REQ-PGPP-017 |
-| IT-POOL-018 | `PendingRequestsGetNullopt` (standalone) | REQ-PGPP-021 |
+| IT-POOL-018 | `PendingRequestsGetNullopt` (standalone) — queued requests drain with `nullopt`, the running one is cancelled and reports `false`, `shutdown()` returns in under 2 s | REQ-PGPP-021, REQ-PGPP-076 |
 | IT-POOL-019 | `SequentialQueries` (standalone, single connection) | REQ-PGPP-028 |
 | IT-POOL-020 | `ShutdownDuringSlowQuery` (standalone) | REQ-PGPP-020 |
+| IT-POOL-021 | `ShutdownCancelsInFlightStatement` / `ShutdownCancelsLeasedStatement` (standalone) — `pg_sleep(4)` on an executor thread and on a caller's lease; `shutdown()` returns in under 1.5 s, the statement reports `false` | REQ-PGPP-076 |
+| IT-POOL-022 | `PoolExecOnSelectSucceeds` — `execSync` / `execAsync` / `exec` on `SELECT` and `INSERT ... RETURNING` | REQ-PGPP-073 |
+| IT-POOL-023 | `ExcessRequestsAreRefusedAtOnce` (standalone) — `maxQueuedRequests = 2`, pool 1: the third waiting request resolves `nullopt` at once (future and callback); accepted ones complete | REQ-PGPP-078 |
+| IT-POOL-024 | `DefaultPoolSizeIsOnePerCoreUpToEight` (standalone) | REQ-PGPP-079 |
+| IT-POOL-025 | `PoolOptionalParamsAndColumns` — `std::optional` through `execSync` / `execAsync` / `querySync` / `queryAsync` | REQ-PGPP-075 |
 
 ### test_5.0_transactions.cpp — Transactions
 
@@ -268,15 +280,15 @@ Fixture: `PgppIntegrationTest` (+ standalone pool tests)
 | ID | Test | Requirement |
 |---|---|---|
 | IT-STRESS-001 | `ExhaustionUnderSustainedLoad` (standalone) | REQ-PGPP-037, REQ-PGPP-044 |
-| IT-STRESS-002 | `ConnectionSurvivesBackendKill` (standalone) — reset mid-transaction | REQ-PGPP-042, REQ-PGPP-043 |
-| IT-STRESS-003 | `CallbackInFlightAtShutdown` (standalone) — every callback fires once; worker-served ones succeed | REQ-PGPP-021, REQ-PGPP-033, REQ-PGPP-059 |
+| IT-STRESS-002 | `ConnectionSurvivesBackendKill` (standalone) — reset mid-transaction; the next raw and prepared requests succeed (statements prepared again) | REQ-PGPP-042, REQ-PGPP-043 |
+| IT-STRESS-003 | `CallbackInFlightAtShutdown` (standalone) — every callback fires once before `shutdown()` returns; served ones succeed except the one cancelled by shutdown | REQ-PGPP-021, REQ-PGPP-033, REQ-PGPP-070, REQ-PGPP-076 |
 | IT-STRESS-004 | `ConcurrentPrepareStatementFromThreads` | REQ-PGPP-026, REQ-PGPP-027 |
 | IT-STRESS-005 | `CoroutineThrowAfterAwait` | REQ-PGPP-046 |
 | IT-STRESS-006 | `ShutdownWhileSuspended` (standalone) | REQ-PGPP-021, REQ-PGPP-022 |
 | IT-STRESS-007 | `ParamLongString` | REQ-PGPP-016 |
 | IT-STRESS-008 | `ParamUnicode` | REQ-PGPP-016 |
 | IT-STRESS-009 | `ParamEmptyString` | REQ-PGPP-016 |
-| IT-STRESS-010 | `ParamEmbeddedNulTruncatedByTextFormat` | REQ-PGPP-016 |
+| IT-STRESS-010 | `ParamEmbeddedNulIsRejected` — refused by both overloads, nothing inserted | REQ-PGPP-074 |
 | IT-STRESS-011 | `PrepareStatementRightAfterInitialize` (standalone) — statement registered right after `initialize()` is usable at once | REQ-PGPP-059, REQ-PGPP-026 |
 | IT-STRESS-012 | `ShutdownRightAfterInitializeDoesNotHang` (standalone) — many initialize/shutdown cycles under a watchdog | REQ-PGPP-060, REQ-PGPP-020 |
 
@@ -299,13 +311,22 @@ failed assertion. IT-REENTRY-007..009 are data-race tests whose detector is Thre
 | IT-REENTRY-010 | `MixedApiStorm` — 6 clients × every API, callbacks that use the sync API and fire callbacks, `shutdown()` mid-storm, pool sizes 1 / 2 / 8; every request completes exactly once | REQ-PGPP-067..070 |
 | IT-REENTRY-011 | `ReleaseRollsBackStrayTransaction` — pool 1: an INSERT after another caller's stray `BEGIN` persists; an aborted transaction does not poison the next caller | REQ-PGPP-072 |
 
+### test_9.1_session.cpp — Session State Between Callers
+
+All standalone.
+
+| ID | Test | Requirement |
+|---|---|---|
+| IT-SESSION-001 | `SetLeaksBetweenCallersByDefault` — pool 4, 8 clients × 250 requests, one `SET`: later requests see it (pins the documented default) | REQ-PGPP-072 |
+| IT-SESSION-002 | `SetDoesNotLeakWithSessionReset` — same load with `resetSessionAfterRequest`: 0 leaks | REQ-PGPP-080 |
+| IT-SESSION-003 | `TempStateDoesNotLeakWithSessionReset` — pool 1: temp table gone, advisory lock released (a second session can take it), `LISTEN` undone, prepared statements kept | REQ-PGPP-080 |
+| IT-SESSION-004 | `SetLocalInsideTransactionDoesNotLeak` — the zero-cost pattern | REQ-PGPP-072 |
+
 ---
 
 ## Future Work
 
 - Behavior when PostgreSQL is restarted mid-operation
-- Memory leak detection (valgrind/ASan)
-- Thread sanitizer validation
 
 ---
 
@@ -338,6 +359,8 @@ tests/
     test_6.0_raw.cpp          # IT-RAW-*
     test_7.0_coroutines.cpp   # IT-CORO-*
     test_8.0_stress.cpp       # IT-STRESS-*
+    test_9.0_reentrancy.cpp   # IT-REENTRY-*
+    test_9.1_session.cpp      # IT-SESSION-*
 ```
 
 ### CMake Integration
@@ -367,10 +390,21 @@ endif()
 ### Docker Fixture
 
 Integration tests auto-manage a PostgreSQL container:
-- **Image:** `postgres:16-alpine`
+- **Image:** `postgres:16-alpine` (`PGPP_TEST_PG_IMAGE` overrides; CI runs 13, 14, 15, 17 too)
 - **Container:** `pgpp-test-pg-7f3a`
-- **Port:** 15432
+- **Port:** 127.0.0.1:15432 (loopback only: the container's superuser has a well-known password)
 - **Skip:** Set `PGPP_SKIP_DOCKER=1` to use an external PostgreSQL instance
+
+### CI
+
+| Job | What it adds |
+|---|---|
+| Build-Linux (gcc / clang × Debug / Release) | warnings as errors, unit + integration (Docker) |
+| ThreadSanitizer | the whole suite under TSan |
+| AddressSanitizer | the whole suite under ASan + UBSan |
+| PostgreSQL-Versions (13, 14, 15, 17) | the integration suite against each supported server |
+| Build-Windows / Build-MacOS | unit + integration against a PostgreSQL set up by `ikalnytskyi/action-setup-postgres` |
+| CodeChecker | clang-tidy + clang static analyzer over the library and the tests |
 
 ### Test Naming Convention
 
