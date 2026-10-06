@@ -23,7 +23,8 @@
 
 #include <atomic>
 #include <condition_variable>
-#include <cstring>        // std::strcmp (COMMIT command tag)
+#include <cstdio>         // std::snprintf (savepoint names)
+#include <cstring>        // std::strcmp (command tags)
 #include <functional>
 #include <future>
 #include <memory>
@@ -103,7 +104,7 @@ public:
     template<typename F>
     std::future<std::optional<bool>> transaction(F&& work) noexcept;
 
-    // Public for coroutine awaitables (see pgpp_coroutines.h)
+    // Public for coroutine awaitables (see pgpp_coroutines.h). Always queues.
     bool enqueueRaw(std::unique_ptr<PgppRequest> request) noexcept;
 
     size_t totalConnections() const noexcept;
@@ -112,10 +113,16 @@ public:
     size_t queuedRequests()   const noexcept;
 
 private:
+    // Per-worker-thread state (defined in pgpp.cpp); each worker publishes its own
+    // through t_worker for the thread's lifetime, null on every other thread.
+    struct WorkerContext;
+    static thread_local WorkerContext* t_worker;
+
     size_t      m_poolSize { std::thread::hardware_concurrency() };
     std::string m_connectionString;
 
     std::vector<std::unique_ptr<PgppConnection>> m_connections;
+    std::atomic<size_t>                          m_connectionCount { 0 };   // for the stats getters
     std::queue<std::unique_ptr<PgppRequest>>     m_requestQueue;
 
     mutable std::mutex      m_queueMutex;
@@ -126,16 +133,39 @@ private:
     std::atomic<bool>         m_initialized  { false };
     std::atomic<size_t>       m_busyWorkers  { 0 };
 
+    // initialize(), shutdown() and the deferred teardown run by a worker that called
+    // shutdown() on itself are serialised here (REQ-PGPP-070). Workers never take this
+    // mutex from inside a task, so a shutdown that is joining them cannot deadlock.
+    mutable std::mutex      m_lifecycleMutex;
+    std::condition_variable m_lifecycleChanged;
+    bool                    m_deferredShutdown { false };   // guarded by m_lifecycleMutex
+    std::thread             m_selfShutdownThread;           // joined by the next non-worker shutdown()
+
     mutable std::mutex     m_stmtMutex;
     std::vector<Statement> m_preparedStatements;
     std::atomic<uint32_t>  m_stmtVersion { 0 };
 
     bool createConnections(const PgppConnectionInfo& dbInfo) noexcept;
     bool startWorkerThreads() noexcept;
-    void stopWorkerThreads() noexcept;
+    void signalShutdown() noexcept;
+    void joinWorkers(std::thread::id self) noexcept;
+    void joinSelfShutdownThread() noexcept;
+    void drainQueue() noexcept;
+    void teardown(std::thread::id self) noexcept;
+    bool initializeLocked(const PgppConnectionInfo& dbInfo, size_t poolSize) noexcept;
+    void shutdownLocked() noexcept;
+    void requestShutdownFromWorker() noexcept;
+    void finishShutdownOnWorker() noexcept;
     void workerLoop(size_t connIdx, uint32_t stmtVersion) noexcept;
+    void serveRequest(WorkerContext& ctx, PgppRequest& request) noexcept;
     std::string buildConnectionString(const PgppConnectionInfo& dbInfo) const noexcept;
     void prepareStatementsOnConnection(PgppConnection* conn) noexcept;
+
+    // Where a request runs: inline on the calling worker's own connection when the
+    // caller is one of this pool's workers (REQ-PGPP-067), queued otherwise.
+    bool onOwnWorker() const noexcept;
+    bool submit(std::unique_ptr<PgppRequest> request) noexcept;
+    static int inlineDepth() noexcept;   // 0 off a worker; nesting level of inline requests on one
 
 #ifdef PGPP_TESTING
     friend class PgppPoolTest;
@@ -172,6 +202,19 @@ void invokeCallback(Callback& callback, Args&&... args) noexcept
         callback(std::forward<Args>(args)...);
     } catch (...) {
     }
+}
+
+// One command, success = PGRES_COMMAND_OK and, when given, the expected command
+// tag. PostgreSQL answers COMMIT on an aborted transaction with "ROLLBACK" and
+// PGRES_COMMAND_OK, so the tag is the only honest signal (REQ-PGPP-036).
+inline bool execCommand(PGconn* pg, const char* sql, const char* expectedTag) noexcept
+{
+    PGresult* res = PQexec(pg, sql);
+    const bool ok = res != nullptr
+        && PQresultStatus(res) == PGRES_COMMAND_OK
+        && (expectedTag == nullptr || std::strcmp(PQcmdStatus(res), expectedTag) == 0);
+    PQclear(res);
+    return ok;
 }
 
 // The caller's statement name and arguments, copied once into shared storage
@@ -243,7 +286,7 @@ std::future<std::optional<bool>> PgppPool::execAsync(const std::string& statemen
                 }, *bound));
             }
         };
-        if (!enqueueRaw(std::move(request))) [[unlikely]] {
+        if (!submit(std::move(request))) [[unlikely]] {
             promise->set_value(std::nullopt);
         }
         return future;
@@ -278,7 +321,7 @@ PgppPool::queryAsync(const std::string& statement, const Ts&... args) noexcept
                 promise->set_value({ ok, std::move(rows) });
             }
         };
-        if (!enqueueRaw(std::move(request))) [[unlikely]] {
+        if (!submit(std::move(request))) [[unlikely]] {
             promise->set_value({ std::nullopt, {} });
         }
         return future;
@@ -311,7 +354,7 @@ void PgppPool::exec(const std::string& statement,
                 }
             }, *bound);
         };
-        if (!enqueueRaw(std::move(request))) [[unlikely]] {
+        if (!submit(std::move(request))) [[unlikely]] {
             Internal::invokeCallback(onDone, std::nullopt);
         }
     } catch (...) {
@@ -343,7 +386,7 @@ void PgppPool::query(const std::string& statement,
                 }
             }, *bound);
         };
-        if (!enqueueRaw(std::move(request))) [[unlikely]] {
+        if (!submit(std::move(request))) [[unlikely]] {
             Internal::invokeCallback(onDone, std::nullopt, std::vector<RowTuple> {});
         }
     } catch (...) {
@@ -373,10 +416,22 @@ std::future<std::optional<bool>> PgppPool::transaction(F&& work) noexcept
 
             PGconn* pg = conn->connection();
 
-            PGresult* res = PQexec(pg, "BEGIN");
-            const bool begun = res && PQresultStatus(res) == PGRES_COMMAND_OK;
-            PQclear(res);
-            if (!begun) {
+            // Issued from inside transaction() work (inline on the same connection,
+            // REQ-PGPP-067) the connection is already in a transaction: this one
+            // becomes a savepoint named by its nesting level (REQ-PGPP-068). A
+            // queued request always finds the connection idle.
+            const int  depth  = PgppPool::inlineDepth();
+            const bool nested = depth > 0 && PQtransactionStatus(pg) == PQTRANS_INTRANS;
+            char beginSql[40];
+            char commitSql[48];
+            char rollbackSql[88];
+            if (nested) {
+                std::snprintf(beginSql,    sizeof beginSql,    "SAVEPOINT pgpp_sp_%d", depth);
+                std::snprintf(commitSql,   sizeof commitSql,   "RELEASE SAVEPOINT pgpp_sp_%d", depth);
+                std::snprintf(rollbackSql, sizeof rollbackSql, "ROLLBACK TO SAVEPOINT pgpp_sp_%d; RELEASE SAVEPOINT pgpp_sp_%d", depth, depth);
+            }
+
+            if (!Internal::execCommand(pg, nested ? beginSql : "BEGIN", nullptr)) {
                 promise->set_value(false);
                 return;
             }
@@ -398,21 +453,19 @@ std::future<std::optional<bool>> PgppPool::transaction(F&& work) noexcept
             // A failed statement leaves the transaction aborted (PQTRANS_INERROR),
             // and COMMIT on an aborted transaction answers "ROLLBACK" with
             // PGRES_COMMAND_OK. Only a healthy open transaction may be committed
-            // (REQ-PGPP-065).
+            // (REQ-PGPP-065). For a savepoint, ROLLBACK TO restores the enclosing
+            // transaction to a healthy state.
             if (!workOk || PQtransactionStatus(pg) != PQTRANS_INTRANS) {
-                PQclear(PQexec(pg, "ROLLBACK"));
+                Internal::execCommand(pg, nested ? rollbackSql : "ROLLBACK", nullptr);
                 promise->set_value(false);
                 return;
             }
 
-            res = PQexec(pg, "COMMIT");
-            const bool committed = res
-                && PQresultStatus(res) == PGRES_COMMAND_OK
-                && std::strcmp(PQcmdStatus(res), "COMMIT") == 0;   // REQ-PGPP-036
-            PQclear(res);
-            promise->set_value(committed);
+            // REQ-PGPP-036: success only with the matching command tag.
+            promise->set_value(Internal::execCommand(pg, nested ? commitSql : "COMMIT",
+                                                     nested ? "RELEASE" : "COMMIT"));
         };
-        if (!enqueueRaw(std::move(request))) [[unlikely]] {
+        if (!submit(std::move(request))) [[unlikely]] {
             promise->set_value(std::nullopt);
         }
         return future;

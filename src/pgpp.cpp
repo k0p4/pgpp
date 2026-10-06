@@ -25,6 +25,37 @@
 
 PGPP_DEFINE_LOG_MODULE(PgppPool)
 
+// ── Worker identity ──────────────────────────────────────────────────────────
+//
+// Each worker thread owns one WorkerContext for its lifetime and publishes it
+// through t_worker. User code that runs on a worker (callbacks, transaction
+// work, resumed coroutines) can therefore be recognised, and a request it issues
+// runs inline on that worker's connection instead of being queued: the
+// connection is idle while user code runs, and blocking on a queued request
+// from a worker would wait for a worker that may be this very thread
+// (REQ-PGPP-067).
+
+struct PgppPool::WorkerContext {
+    PgppPool*       pool;
+    PgppConnection* conn;
+    int             depth             { 0 };      // nesting of inline requests
+    bool            shutdownRequested { false };  // shutdown() was called on this worker
+};
+
+thread_local PgppPool::WorkerContext* PgppPool::t_worker = nullptr;
+
+bool PgppPool::onOwnWorker() const noexcept
+{
+    return t_worker != nullptr && t_worker->pool == this;
+}
+
+int PgppPool::inlineDepth() noexcept
+{
+    return t_worker != nullptr ? t_worker->depth : 0;
+}
+
+// ── Connection string ────────────────────────────────────────────────────────
+
 static std::string escapeConnValue(const std::string& v)
 {
     std::string out;
@@ -87,6 +118,8 @@ std::string PgppPool::buildConnectionString(const PgppConnectionInfo& dbInfo) co
     }
 }
 
+// ── Connections and statements ───────────────────────────────────────────────
+
 bool PgppPool::createConnections(const PgppConnectionInfo& dbInfo) noexcept
 {
     try {
@@ -107,6 +140,7 @@ bool PgppPool::createConnections(const PgppConnectionInfo& dbInfo) noexcept
             prepareStatementsOnConnection(conn.get());
             m_connections.push_back(std::move(conn));
         }
+        m_connectionCount.store(m_connections.size(), std::memory_order_release);
 
         PGPP_LOGD << "Created " << m_poolSize << " connections";
         return true;
@@ -135,6 +169,8 @@ void PgppPool::prepareStatementsOnConnection(PgppConnection* conn) noexcept
     }
 }
 
+// ── Worker threads ───────────────────────────────────────────────────────────
+
 bool PgppPool::startWorkerThreads() noexcept
 {
     // Capture the statement version *before* the threads exist: a prepareStatement()
@@ -156,33 +192,40 @@ bool PgppPool::startWorkerThreads() noexcept
     }
 }
 
-void PgppPool::stopWorkerThreads() noexcept
+void PgppPool::signalShutdown() noexcept
 {
     try {
         // Flip the flag under m_queueMutex: the workers test it inside their wait
         // predicate, so a flip + notify between that test and the actual block would
-        // otherwise be lost and join() below would never return.
+        // otherwise be lost and join() would never return (REQ-PGPP-060).
         std::lock_guard<std::mutex> lock(m_queueMutex);
-        if (m_shuttingDown.exchange(true)) {
-            return;
-        }
+        m_shuttingDown.store(true);
     } catch (...) {
         // Locking failed: set the flag anyway; the workers also test it unlocked.
         PGPP_LOGE << "Failed to lock the queue while stopping workers";
-        if (m_shuttingDown.exchange(true)) {
-            return;
-        }
+        m_shuttingDown.store(true);
     }
     m_requestQueued.notify_all();
+}
 
+void PgppPool::joinWorkers(std::thread::id self) noexcept
+{
     for (auto& worker : m_workerThreads) {
+        if (worker.get_id() == self) {
+            // A thread cannot join itself: the worker running the deferred teardown
+            // keeps its handle here for the next non-worker shutdown() to join
+            // (REQ-PGPP-069). Never detached: the destructor must be able to wait.
+            joinSelfShutdownThread();
+            m_selfShutdownThread = std::move(worker);
+            continue;
+        }
         try {
             if (worker.joinable()) {
                 worker.join();
             }
         } catch (...) {
-            // join() can only fail for a thread that is not joinable or is the
-            // current thread; a thread left joinable would terminate the process.
+            // Cannot happen for another thread that is joinable; a thread left
+            // joinable would terminate the process, so detach is the lesser evil.
             PGPP_LOGE << "Failed to join a worker thread";
             if (worker.joinable()) {
                 worker.detach();
@@ -192,9 +235,91 @@ void PgppPool::stopWorkerThreads() noexcept
     m_workerThreads.clear();
 }
 
+void PgppPool::joinSelfShutdownThread() noexcept
+{
+    try {
+        if (m_selfShutdownThread.joinable()) {
+            m_selfShutdownThread.join();
+        }
+    } catch (...) {
+        PGPP_LOGE << "Failed to join the worker that ran shutdown()";
+        if (m_selfShutdownThread.joinable()) {
+            m_selfShutdownThread.detach();
+        }
+    }
+}
+
+void PgppPool::drainQueue() noexcept
+{
+    // Drain pending requests one at a time, outside the lock: task(nullptr)
+    // resumes coroutines which may call enqueueRaw. No intermediate container,
+    // so nothing here can fail for lack of memory.
+    while (true) {
+        std::unique_ptr<PgppRequest> request;
+        try {
+            std::lock_guard<std::mutex> lock(m_queueMutex);
+            if (m_requestQueue.empty()) {
+                break;
+            }
+            request = std::move(m_requestQueue.front());
+            m_requestQueue.pop();
+        } catch (...) {
+            PGPP_LOGE << "Failed to lock the queue while draining; pending requests dropped";
+            break;
+        }
+        try { request->task(nullptr); } catch (...) {}
+    }
+}
+
+void PgppPool::teardown(std::thread::id self) noexcept
+{
+    signalShutdown();
+    joinWorkers(self);
+    drainQueue();
+    m_connectionCount.store(0, std::memory_order_release);
+    m_connections.clear();
+    PGPP_LOGD << "Pool shut down";
+}
+
+void PgppPool::serveRequest(WorkerContext& ctx, PgppRequest& request) noexcept
+{
+    PgppConnection* conn = ctx.conn;
+
+    if (!conn->isOpen()) [[unlikely]] {
+        PGPP_LOGW << "Connection lost, reconnecting...";
+        conn->reset();
+        if (conn->isOpen()) {
+            prepareStatementsOnConnection(conn);
+            PGPP_LOGD << "Connection restored";
+        } else {
+            PGPP_LOGE << "Reconnect failed";
+            try { request.task(nullptr); } catch (...) {}
+            return;
+        }
+    }
+
+    // Inline (nested) requests run inside the outer task's busy period.
+    if (ctx.depth == 0) {
+        m_busyWorkers.fetch_add(1, std::memory_order_relaxed);
+    }
+    ++ctx.depth;
+    try {
+        request.task(conn);
+    } catch (const std::exception& e) {
+        PGPP_LOGE << "Request exception: " << e.what();
+    } catch (...) {
+        PGPP_LOGE << "Unknown request exception";
+    }
+    --ctx.depth;
+    if (ctx.depth == 0) {
+        m_busyWorkers.fetch_sub(1, std::memory_order_relaxed);
+    }
+}
+
 void PgppPool::workerLoop(size_t connIdx, uint32_t stmtVersion) noexcept
 {
-    PgppConnection* conn = m_connections[connIdx].get();
+    WorkerContext ctx { this, m_connections[connIdx].get() };
+    t_worker = &ctx;
     uint32_t localStmtVersion = stmtVersion;
 
     while (!m_shuttingDown.load()) {
@@ -228,35 +353,33 @@ void PgppPool::workerLoop(size_t connIdx, uint32_t stmtVersion) noexcept
         uint32_t currentVersion = m_stmtVersion.load(std::memory_order_acquire);
         if (currentVersion != localStmtVersion) {
             localStmtVersion = currentVersion;
-            prepareStatementsOnConnection(conn);
+            prepareStatementsOnConnection(ctx.conn);
         }
 
         if (!request) [[unlikely]] {
             continue;
         }
 
-        if (!conn->isOpen()) [[unlikely]] {
-            PGPP_LOGW << "Connection " << connIdx << " lost, reconnecting...";
-            conn->reset();
-            if (conn->isOpen()) {
-                prepareStatementsOnConnection(conn);
-                PGPP_LOGD << "Connection " << connIdx << " restored";
-            } else {
-                PGPP_LOGE << "Connection " << connIdx << " reconnect failed";
-                try { request->task(nullptr); } catch (...) {}
-                continue;
-            }
-        }
+        serveRequest(ctx, *request);
+        request.reset();
 
-        m_busyWorkers.fetch_add(1, std::memory_order_relaxed);
-        try {
-            request->task(conn);
-        } catch (const std::exception& e) {
-            PGPP_LOGE << "Request exception: " << e.what();
-        } catch (...) {
-            PGPP_LOGE << "Unknown request exception";
+        if (ctx.shutdownRequested) [[unlikely]] {
+            // shutdown() was called from this task's user code (REQ-PGPP-069).
+            finishShutdownOnWorker();
+            break;
         }
-        m_busyWorkers.fetch_sub(1, std::memory_order_relaxed);
+    }
+
+    t_worker = nullptr;
+}
+
+bool PgppPool::submit(std::unique_ptr<PgppRequest> request) noexcept
+{
+    if (onOwnWorker()) {
+        serveRequest(*t_worker, *request);
+        return true;
+    } else {
+        return enqueueRaw(std::move(request));
     }
 }
 
@@ -280,6 +403,8 @@ bool PgppPool::enqueueRaw(std::unique_ptr<PgppRequest> request) noexcept
     }
 }
 
+// ── Lifecycle ────────────────────────────────────────────────────────────────
+
 PgppPool::PgppPool()
 {
     if (m_poolSize == 0) m_poolSize = 16;
@@ -290,7 +415,7 @@ PgppPool::~PgppPool()
     shutdown();
 }
 
-bool PgppPool::initialize(const PgppConnectionInfo& dbInfo, size_t poolSize) noexcept
+bool PgppPool::initializeLocked(const PgppConnectionInfo& dbInfo, size_t poolSize) noexcept
 {
     if (m_initialized.exchange(true)) [[unlikely]] {
         PGPP_LOGW << "Already initialized";
@@ -304,8 +429,7 @@ bool PgppPool::initialize(const PgppConnectionInfo& dbInfo, size_t poolSize) noe
     }
 
     if (!createConnections(dbInfo) || !startWorkerThreads()) [[unlikely]] {
-        stopWorkerThreads();        // joins whatever did start
-        m_connections.clear();
+        teardown(std::thread::id {});   // joins whatever did start
         m_initialized = false;
         return false;
     }
@@ -314,35 +438,90 @@ bool PgppPool::initialize(const PgppConnectionInfo& dbInfo, size_t poolSize) noe
     return true;
 }
 
-void PgppPool::shutdown() noexcept
+bool PgppPool::initialize(const PgppConnectionInfo& dbInfo, size_t poolSize) noexcept
 {
+    if (onOwnWorker()) {
+        // A worker exists, so the pool is initialized; taking m_lifecycleMutex here
+        // could wait on a shutdown() that is waiting on this worker.
+        PGPP_LOGW << "initialize() called from a worker thread";
+        return m_initialized.load();
+    }
+
+    try {
+        std::unique_lock<std::mutex> lock(m_lifecycleMutex);
+        m_lifecycleChanged.wait(lock, [this] { return !m_deferredShutdown; });
+        joinSelfShutdownThread();
+        return initializeLocked(dbInfo, poolSize);
+    } catch (...) {
+        PGPP_LOGE << "initialize: lifecycle lock failed";
+        return initializeLocked(dbInfo, poolSize);
+    }
+}
+
+void PgppPool::shutdownLocked() noexcept
+{
+    joinSelfShutdownThread();
     if (!m_initialized.exchange(false)) [[unlikely]] {
         return;
     }
+    teardown(std::thread::id {});
+}
 
-    stopWorkerThreads();
-
-    // Drain pending requests one at a time, outside the lock: task(nullptr)
-    // resumes coroutines which may call enqueueRaw. No intermediate container,
-    // so nothing here can fail for lack of memory.
-    while (true) {
-        std::unique_ptr<PgppRequest> request;
-        try {
-            std::lock_guard<std::mutex> lock(m_queueMutex);
-            if (m_requestQueue.empty()) {
-                break;
-            }
-            request = std::move(m_requestQueue.front());
-            m_requestQueue.pop();
-        } catch (...) {
-            PGPP_LOGE << "Failed to lock the queue while draining; pending requests dropped";
-            break;
-        }
-        try { request->task(nullptr); } catch (...) {}
+void PgppPool::shutdown() noexcept
+{
+    if (onOwnWorker()) {
+        requestShutdownFromWorker();
+        return;
     }
 
-    m_connections.clear();
-    PGPP_LOGD << "Pool shut down";
+    try {
+        std::unique_lock<std::mutex> lock(m_lifecycleMutex);
+        // A worker that called shutdown() on itself finishes the teardown after its
+        // task; wait for that rather than racing it (REQ-PGPP-069).
+        m_lifecycleChanged.wait(lock, [this] { return !m_deferredShutdown; });
+        shutdownLocked();
+    } catch (...) {
+        PGPP_LOGE << "shutdown: lifecycle lock failed";
+        shutdownLocked();
+    }
+}
+
+void PgppPool::requestShutdownFromWorker() noexcept
+{
+    // If a shutdown is already in progress elsewhere, it has exchanged the flag and
+    // is (or will be) joining this worker: nothing to do but finish the task.
+    if (!m_initialized.exchange(false)) {
+        return;
+    }
+    PGPP_LOGW << "shutdown() called from a worker thread: teardown deferred until its task returns";
+    try {
+        std::lock_guard<std::mutex> lock(m_lifecycleMutex);
+        m_deferredShutdown = true;
+    } catch (...) {
+        m_deferredShutdown = true;
+    }
+    signalShutdown();   // other workers exit, new requests are refused
+    t_worker->shutdownRequested = true;
+}
+
+void PgppPool::finishShutdownOnWorker() noexcept
+{
+    // Runs on the worker after the task that called shutdown() returned. Holds
+    // m_lifecycleMutex so a concurrent non-worker shutdown()/initialize() waits.
+    // After the final unlock this thread touches nothing of the pool: the
+    // waiting thread joins its handle (kept in joinWorkers) and may destroy
+    // the pool right after.
+    try {
+        std::lock_guard<std::mutex> lock(m_lifecycleMutex);
+        teardown(std::this_thread::get_id());
+        m_deferredShutdown = false;
+        m_lifecycleChanged.notify_all();
+    } catch (...) {
+        PGPP_LOGE << "deferred shutdown: lifecycle lock failed";
+        teardown(std::this_thread::get_id());
+        m_deferredShutdown = false;
+        m_lifecycleChanged.notify_all();
+    }
 }
 
 bool PgppPool::isInitialized() const noexcept { return m_initialized.load(); }
@@ -357,18 +536,35 @@ void PgppPool::prepareStatement(const Statement& statement) noexcept
         return;
     }
 
-    if (m_workerThreads.empty()) {
-        for (auto& conn : m_connections) {
-            if (!conn->prepare(statement)) [[unlikely]] {
-                PGPP_LOGW << "Failed to prepare: " << statement.statementName;
+    if (onOwnWorker()) {
+        // Workers exist, so only the version bump applies; m_lifecycleMutex may be
+        // held by a shutdown() that is waiting on this very worker.
+        m_stmtVersion.fetch_add(1, std::memory_order_release);
+        m_requestQueued.notify_all();
+        return;
+    }
+
+    try {
+        std::lock_guard<std::mutex> lock(m_lifecycleMutex);
+        if (m_workerThreads.empty()) {
+            for (auto& conn : m_connections) {
+                if (!conn->prepare(statement)) [[unlikely]] {
+                    PGPP_LOGW << "Failed to prepare: " << statement.statementName;
+                }
             }
+        } else {
+            // Wake all workers — each will check m_stmtVersion and re-prepare.
+            m_stmtVersion.fetch_add(1, std::memory_order_release);
+            m_requestQueued.notify_all();
         }
-    } else {
-        // Wake all workers — each will check m_stmtVersion and re-prepare.
+    } catch (...) {
+        PGPP_LOGE << "prepareStatement: lifecycle lock failed; statement applies on the next re-prepare";
         m_stmtVersion.fetch_add(1, std::memory_order_release);
         m_requestQueued.notify_all();
     }
 }
+
+// ── Raw SQL ──────────────────────────────────────────────────────────────────
 
 bool PgppPool::execRawSync(const std::string& sql) noexcept
 {
@@ -403,7 +599,7 @@ std::future<std::optional<bool>> PgppPool::execRawAsync(const std::string& sql) 
                 promise->set_value(conn->execRaw(sql));
             }
         };
-        if (!enqueueRaw(std::move(request))) [[unlikely]] {
+        if (!submit(std::move(request))) [[unlikely]] {
             promise->set_value(std::nullopt);
         }
         return future;
@@ -413,16 +609,24 @@ std::future<std::optional<bool>> PgppPool::execRawAsync(const std::string& sql) 
     }
 }
 
-size_t PgppPool::totalConnections() const noexcept { return m_connections.size(); }
+// ── Statistics ───────────────────────────────────────────────────────────────
+
+size_t PgppPool::totalConnections() const noexcept
+{
+    return m_connectionCount.load(std::memory_order_acquire);
+}
 
 size_t PgppPool::freeConnections() const noexcept
 {
-    const size_t busy = m_busyWorkers.load(std::memory_order_relaxed);
-    const size_t total = m_connections.size();
+    const size_t busy  = m_busyWorkers.load(std::memory_order_relaxed);
+    const size_t total = m_connectionCount.load(std::memory_order_acquire);
     return (busy <= total) ? (total - busy) : 0;
 }
 
-size_t PgppPool::busyConnections() const noexcept { return m_busyWorkers.load(std::memory_order_relaxed); }
+size_t PgppPool::busyConnections() const noexcept
+{
+    return m_busyWorkers.load(std::memory_order_relaxed);
+}
 
 size_t PgppPool::queuedRequests() const noexcept
 {

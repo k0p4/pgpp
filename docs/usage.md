@@ -108,6 +108,41 @@ bool committed = f.get().value_or(false);   // nullopt only when the pool is shu
 A `void` work is equivalent to one that always returns `true`: it still rolls back if a
 statement failed, it just cannot abort on its own without throwing.
 
+## Calling the Pool from a Callback or Transaction
+
+Callbacks, `transaction()` work and coroutine bodies after `co_await` run on one of the pool's
+own worker threads. Any request you issue from there runs **immediately, on that worker's
+connection**, instead of being queued:
+
+```cpp
+db.exec("audit", [&](std::optional<bool>) {
+    db.execSync("notify_admin", id);          // runs right here, on this connection
+    auto f = db.execAsync("bump_counter");    // already resolved when it returns
+});
+
+db.transaction([&](PgppConnection& conn) {
+    conn.execRaw("UPDATE wallet SET balance = balance - 100 WHERE id = '1'");
+    return db.execSync("credit", std::string("2"));   // same connection: inside the transaction
+});
+```
+
+This is what makes the sync and future APIs safe from a worker: a queued request would wait
+for a free worker, which at pool size 1 is the calling thread itself. It is also what keeps
+a pool call inside `transaction()` work inside that transaction. A `transaction()` started
+inside `transaction()` work becomes a savepoint: its own rollback undoes only its statements,
+and an outer rollback still undoes it.
+
+Two consequences to keep in mind:
+
+- a callback issued from a callback has already run when the outer `exec` returns;
+- `co_await` is the exception: it queues, because suspending is how the coroutine hands the
+  worker back, so a `co_await` from a callback-resumed coroutine may be served by another
+  worker.
+
+`shutdown()` from a worker returns immediately and the teardown completes after your callback
+returns; a later `shutdown()` or the destructor, called from one of your own threads, waits for
+it. Do not destroy the pool from a worker thread.
+
 ## Statement Preparation
 
 Statements are prepared once and available on all pool connections.

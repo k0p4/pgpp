@@ -111,7 +111,7 @@ When changing API, tests, or build system — update the corresponding docs:
 ## Key Conventions
 
 - **Logging:** Compile-time selectable via `PGPP_USE_ALOG` or `PGPP_USE_STDERR`; defaults to no-op
-- **Threading:** Pool is thread-safe (mutex + condition_variable + atomics). Connection is NOT thread-safe.
+- **Threading:** Pool is thread-safe (mutex + condition_variable + atomics); `initialize`/`shutdown` are serialised by a lifecycle mutex that workers never take. A request issued from one of the pool's own workers (callback, transaction work, resumed coroutine) runs inline on that worker's connection (REQ-PGPP-067); nested `transaction()` is a savepoint; `shutdown()` from a worker defers its teardown to that worker. The whole suite runs under ThreadSanitizer in CI. Connection is NOT thread-safe.
 - **Result decoding:** results are fetched in binary format (REQ-PGPP-062) and decoded by column OID into string / any integral type / double / float / bool, range-checked. No text parsing. Non-text columns read into `std::string` need `::text` in SQL; `numeric` needs `::int8`/`::float8`. NULL becomes the C++ default value.
 - **OIDs:** Use `pg::` namespace constants (e.g., `pg::TEXT`, `pg::INT4`), not legacy macros
 - **Parameters:** All query parameters are passed as text-format strings (`.c_str()`); only results are binary

@@ -56,15 +56,20 @@ std::optional<std::string> runUnderWatchdog(std::chrono::seconds limit, Body bod
 
 void prepareHelpers(PgppPool& pool)
 {
-    pool.prepareStatement({"r_one",   "SELECT 1", {}});
-    pool.prepareStatement({"r_pid",   "SELECT pg_backend_pid()", {}});
-    pool.prepareStatement({"r_count", "SELECT COUNT(*)::int4 FROM pgpp_reentry", {}});
+    pool.prepareStatement({"r_one", "SELECT 1", {}});
+    pool.prepareStatement({"r_pid", "SELECT pg_backend_pid()", {}});
 }
 
+// PREPARE validates the table, so the count statement is registered only once
+// the table exists.
 bool makeTable(PgppPool& pool)
 {
     pool.execRawSync("DROP TABLE IF EXISTS pgpp_reentry");
-    return pool.execRawSync("CREATE TABLE pgpp_reentry (name VARCHAR(64))");
+    if (!pool.execRawSync("CREATE TABLE pgpp_reentry (name VARCHAR(64))")) {
+        return false;
+    }
+    pool.prepareStatement({"r_count", "SELECT COUNT(*)::int4 FROM pgpp_reentry", {}});
+    return true;
 }
 
 void dropTable(PgppPool& pool)

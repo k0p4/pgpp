@@ -198,13 +198,15 @@ Thread-safe connection pool. One worker thread per connection.
 | Constructor | `PgppPool()` | Sets `m_poolSize` to `hardware_concurrency()` (falls back to 16 if 0) |
 | Destructor | `~PgppPool()` | Calls `shutdown()` |
 | `initialize` | `bool initialize(const PgppConnectionInfo&, size_t poolSize=0)` | Builds connection string, creates connections, prepares registered statements, starts worker threads. If `poolSize > 0`, overrides the default. |
-| `shutdown` | `void shutdown()` | Stops workers, drains pending requests (delivers `nullptr`), closes connections |
+| `shutdown` | `void shutdown()` | Stops workers, drains pending requests (delivers `nullptr`), closes connections. From a worker thread (inside a callback, transaction work or a resumed coroutine): returns at once and that worker finishes the teardown after its task (REQ-PGPP-069). |
 | `isInitialized` | `bool isInitialized() const noexcept` | Atomic check |
 
 **Requirements:**
 
 - **REQ-PGPP-019:** `initialize` must be idempotent -- second call returns `true` without reinitializing.
 - **REQ-PGPP-020:** `shutdown` must be safe to call multiple times (atomic guard on `m_initialized`).
+- **REQ-PGPP-069:** A thread cannot join itself, so `shutdown()` called on one of the pool's own workers must not join: it marks the pool uninitialized (new requests are refused), signals the other workers, and returns. When the task that called it returns, that worker performs the teardown (joins the other workers, drains the queue, closes the connections) and exits; its thread handle is kept, never detached, and joined by the next `shutdown()` or `initialize()` from a non-worker thread, which wait for the deferred teardown to finish before doing anything else. The destructor therefore cannot free the pool under a worker that is still finishing. Destroying the pool from a worker thread remains forbidden (REQ-PGPP-061).
+- **REQ-PGPP-070:** `initialize()`, `shutdown()` and the deferred teardown are serialised by `m_lifecycleMutex`, and `prepareStatement()` takes it on a non-worker thread; so two threads calling `initialize`/`shutdown` concurrently leave the pool either fully initialized with exactly `poolSize` connections or fully shut down, never a mixture. Workers never take this mutex from inside a task (a `shutdown()` that is joining them may hold it): on a worker, `initialize()` reports the current state, `prepareStatement()` only bumps the statement version, and `shutdown()` follows REQ-PGPP-069. The statistics getters read an atomic connection count and never block.
 - **REQ-PGPP-021:** `shutdown` must drain all pending requests, invoking each task with `nullptr` so that futures receive `std::nullopt`.
 - **REQ-PGPP-022:** Pending requests are drained outside the queue lock to avoid deadlock when tasks call `enqueueRaw` (e.g., coroutine resumption).
 - **REQ-PGPP-060:** `stopWorkerThreads` must set `m_shuttingDown` while holding `m_queueMutex` and only then notify `m_requestQueued`. Workers test the flag inside their wait predicate; flipping it outside the mutex can land between that test and the actual block, the notification is lost, and `join()` never returns. `shutdown()` must never hang, however soon after `initialize()` it is called.
@@ -260,8 +262,9 @@ Thread-safe connection pool. One worker thread per connection.
 
 **Requirements:**
 
-- **REQ-PGPP-032:** Callbacks execute on the worker thread, not the calling thread.
+- **REQ-PGPP-032:** A callback runs on the worker thread that executed the request; on the calling thread, with `nullopt`, when the request could not be queued (REQ-PGPP-033); on the `shutdown()` thread, with `nullopt`, when the request was drained; and, when the request was issued from one of the pool's own workers, on that same worker before the `exec`/`query` call returns (REQ-PGPP-067).
 - **REQ-PGPP-033:** If shutting down, enqueue fails, or the request cannot be built, the callback receives `nullopt` immediately on the calling thread, exactly once. An exception thrown by the callback there is caught and dropped (REQ-PGPP-061).
+- **REQ-PGPP-067:** A request issued from one of the pool's own worker threads (from a callback, from `transaction()` work, or from a coroutine body the pool resumed) is executed immediately, inline, on that worker's connection, by every API except the coroutine awaitables: `execSync`, `querySync`, `execRawSync`, `execAsync`, `queryAsync`, `execRawAsync`, `exec`, `query`, `transaction`. The connection is idle while user code runs, so this never blocks; a queued request would wait for a worker that may be the calling thread itself (a certain deadlock at pool size 1, an eventual one at any size), and inside `transaction()` work it would run on another connection, outside the transaction. Inline requests nest; `busyConnections()` counts the worker once. Coroutine `co_await`s keep queueing, since suspending is how a coroutine yields the worker.
 
 ### 5.6 Transactions
 
@@ -276,6 +279,7 @@ Thread-safe connection pool. One worker thread per connection.
 - **REQ-PGPP-036:** `COMMIT` counts as successful only if the result is non-null, `PQresultStatus == PGRES_COMMAND_OK` **and** `PQcmdStatus` equals `"COMMIT"`. PostgreSQL answers a `COMMIT` on an aborted transaction with `PGRES_COMMAND_OK` and the command tag `ROLLBACK`; that must resolve with `false`.
 - **REQ-PGPP-065:** After `work` returns, if `PQtransactionStatus` is not `PQTRANS_INTRANS` (a failed statement left it `PQTRANS_INERROR`; `work` ended the transaction itself; the connection is bad), issue `ROLLBACK` and resolve with `false` without attempting `COMMIT`.
 - **REQ-PGPP-066:** If `work` returns a value convertible to `bool` and it converts to `false`, issue `ROLLBACK` and resolve with `false`. A `void` work behaves as one that returns `true`.
+- **REQ-PGPP-068:** A `transaction()` issued from inside `transaction()` work runs inline on the same connection (REQ-PGPP-067), which is already in a transaction, so it is a savepoint: `SAVEPOINT pgpp_sp_N` where `N` is the inline nesting depth, `RELEASE SAVEPOINT` on success (resolves `true` only with the command tag `RELEASE`), `ROLLBACK TO SAVEPOINT` + `RELEASE` when `work` threw, returned `false`, or a statement failed. An inner rollback undoes only the inner statements; an outer rollback undoes a released inner one. A `transaction()` issued from a callback finds the connection idle and uses `BEGIN`/`COMMIT` as usual.
 
 ### 5.7 Raw Enqueue
 
@@ -292,7 +296,7 @@ Thread-safe connection pool. One worker thread per connection.
 
 | Method | Return | Description |
 |---|---|---|
-| `totalConnections()` | `size_t`, `noexcept` | Number of connections created |
+| `totalConnections()` | `size_t`, `noexcept` | Number of connections created (atomic count; never blocks on the lifecycle lock) |
 | `freeConnections()` | `size_t`, `noexcept` | `total - busy` (clamped to 0) |
 | `busyConnections()` | `size_t`, `noexcept` | Current value of `m_busyWorkers` atomic |
 | `queuedRequests()` | `size_t` (`noexcept`) | Current queue size (acquires lock; 0 if the lock fails) |
@@ -377,7 +381,7 @@ Awaitable for executing a prepared statement without results.
 
 **Requirements:**
 
-- **REQ-PGPP-047:** The coroutine resumes on the worker thread (not the original thread).
+- **REQ-PGPP-047:** The coroutine resumes on the worker thread that executed the request, or on the `shutdown()` thread (with `nullopt`) when the request was drained. A `co_await` issued from a coroutine the pool resumed is queued like any other (it may be served by another worker); it is the one API that does not run inline from a worker (REQ-PGPP-067), because suspending is how the coroutine releases the worker.
 - **REQ-PGPP-048:** Arguments are captured by value in a `std::tuple` to ensure lifetime safety.
 - **REQ-PGPP-058:** The awaiting coroutine is resumed exactly once for every enqueued request; when the statement fails the result is `false`, when the request is drained at shutdown it is `nullopt`.
 
@@ -492,7 +496,7 @@ be distinguishable from failure, and `std::expected<T, E>` where the reason matt
 | REQ-PGPP-029 | Shutting down resolves future with nullopt | 5.4 |
 | REQ-PGPP-030 | Enqueue failure resolves with nullopt | 5.4 |
 | REQ-PGPP-031 | Null connection resolves with nullopt | 5.4 |
-| REQ-PGPP-032 | Callbacks execute on worker thread | 5.5 |
+| REQ-PGPP-032 | Where a callback runs: executing worker, calling thread (not queued), shutdown thread (drained), inline (from a worker) | 5.5 |
 | REQ-PGPP-033 | Shutdown/enqueue fail delivers nullopt to callback | 5.5 |
 | REQ-PGPP-034 | BEGIN failure resolves with false | 5.6 |
 | REQ-PGPP-035 | Exception triggers ROLLBACK | 5.6 |
@@ -507,7 +511,7 @@ be distinguishable from failure, and `std::expected<T, E>` where the reason matt
 | REQ-PGPP-044 | busyWorkers atomic increment/decrement | 6.2 |
 | REQ-PGPP-045 | FireAndForget never leaks frame | 7.1 |
 | REQ-PGPP-046 | FireAndForget catches unhandled exceptions | 7.1 |
-| REQ-PGPP-047 | Coroutine resumes on worker thread | 7.2 |
+| REQ-PGPP-047 | Coroutine resumes on the executing worker (or the shutdown thread); co_await always queues | 7.2 |
 | REQ-PGPP-048 | Arguments captured by value | 7.2 |
 | REQ-PGPP-049 | Result rows moved out in await_resume | 7.3 |
 | REQ-PGPP-050 | Factory functions decay argument types | 7.4 |
@@ -527,3 +531,7 @@ be distinguishable from failure, and `std::expected<T, E>` where the reason matt
 | REQ-PGPP-064 | initialize rolls back on any failure; shutdown drains without allocating | 10 |
 | REQ-PGPP-065 | Aborted (or otherwise not open) transaction after work: ROLLBACK, false | 5.6 |
 | REQ-PGPP-066 | work returning false: ROLLBACK, false | 5.6 |
+| REQ-PGPP-067 | Requests issued from an own worker run inline on that worker's connection | 5.5 |
+| REQ-PGPP-068 | transaction() inside transaction() work is a savepoint | 5.6 |
+| REQ-PGPP-069 | shutdown() from a worker defers its teardown to that worker; joined later, never detached | 5.1 |
+| REQ-PGPP-070 | initialize/shutdown/teardown serialised; workers never take the lifecycle lock | 5.1 |

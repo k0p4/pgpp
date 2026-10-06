@@ -66,6 +66,54 @@ jobs:
           fail-on-empty: false   # a failed build is already red; don't add a second failure
 
 
+  ThreadSanitizer:
+    # Data races are invisible to the ordinary legs; this one runs the whole suite
+    # under TSan and fails on the first report.
+    permissions:
+      checks: write
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: "Install dependencies"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpq-dev
+          # TSan on recent kernels needs a smaller ASLR entropy than the default 32 bits.
+          sudo sysctl vm.mmap_rnd_bits=28
+
+      - uses: actions/checkout@v6
+
+      - name: Build
+        run: |
+          cmake -DCMAKE_BUILD_TYPE=Debug -DPGPP_BUILD_TESTS=ON \
+                -DCMAKE_CXX_FLAGS=-fsanitize=thread -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread \
+                -G "Unix Makefiles" -B build
+          cmake --build build -j $(nproc)
+
+      - name: "Unit tests"
+        env:
+          TSAN_OPTIONS: "halt_on_error=1 second_deadlock_stack=1"
+          GTEST_OUTPUT: xml:${{github.workspace}}/test-results/unit-tests.xml
+        run: ctest --test-dir build --output-on-failure -R pgpp_unit_tests
+
+      - name: "Integration tests"
+        env:
+          TSAN_OPTIONS: "halt_on_error=1 second_deadlock_stack=1"
+          GTEST_OUTPUT: xml:${{github.workspace}}/test-results/integration-tests.xml
+        run: ctest --test-dir build --output-on-failure -R pgpp_integration_tests
+
+      - name: "Test report"
+        uses: dorny/test-reporter@v3
+        if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        with:
+          name: "Tests / ThreadSanitizer"
+          path: test-results/*.xml
+          reporter: java-junit
+          fail-on-empty: false
+
+
   Build-Windows:
     permissions:
       checks: write
